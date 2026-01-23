@@ -1,0 +1,304 @@
+// SystemSetup RC-1.7.1 (Full) — type-mismatch fix, proper listen, zero-break
+// -------------------------------------------------------------------------------------------------
+// Wizard: Name → Breed → Gender → Types → Review → Apply
+// LSL rules:
+//  • No ternary (?:) and no stray break; statements
+//  • Simple if/else branches, explicit casts
+//  • llParseString2List with key:val|key:val payloads
+//  • Notecard reading is ASYNC via dataserver
+//  • Dialog responses handled via llListen on the dialog channel (37)
+//  • Types page paginates to ≤12 buttons with explicit controls
+//  • FIX: removed string comparison with '>' (type mismatch); use llListSort with stride key/value
+//  • FIX: actually establishes llListen() for dialog channel (was missing before)
+// -------------------------------------------------------------------------------------------------
+
+// ===== Link opcodes =====
+integer OP_SETUP_OPEN  = 7950; // ← SystemCore asks to open wizard for key id
+integer OP_SETUP_APPLY = 7951; // → SystemCore receives: NAME:..|BREED:..|GENDER:..|T1:..|T2:..
+integer OP_TITLER_META = 7002; // preview META to HUD/Titler during review
+
+// ===== Notecard =====
+string NC_TYPES = "TypesList"; // one type per line
+
+// ===== Dialog channel =====
+integer DLG_CH = 37;
+integer L_DLG  = 0;
+
+// ===== Wizard state =====
+key    USER     = NULL_KEY;
+string STAGE    = "";          // "name", "breed", "gender", "types", "review"
+string W_NAME   = "";
+string W_BREED  = "";
+string W_GENDER = "";          // ♀ ♂ ⚥ ⚧ allowed
+string W_T1     = "";
+string W_T2     = "";
+
+// ===== Types data (from notecard, async) =====
+list   TYPES_RAW = [];
+list   TYPES     = [];
+integer TPAGE    = 0;
+
+key     rqTypes  = NULL_KEY;   // current dataserver request id
+integer lnTypes  = 0;          // current line index
+integer rdTypes  = FALSE;      // reading flag
+
+// ===== Utils =====
+string trim(string s){ return llStringTrim(s, STRING_TRIM); }
+integer clampi(integer v, integer lo, integer hi){ if(v<lo) return lo; if(v>hi) return hi; return v; }
+integer startsWith(string s, string p){ return llSubStringIndex(s,p) == 0; }
+
+list uniqueLower(list L)
+{
+    list seen = []; list out = [];
+    integer i = 0; integer n = llGetListLength(L);
+    while(i < n)
+    {
+        string t = llList2String(L,i);
+        string k = llToLower(t);
+        if(llListFindList(seen,[k]) == -1){ seen += [k]; out += [t]; }
+        i += 1;
+    }
+    return out;
+}
+
+list sortLower(list L)
+{
+    // Case-insensitive sort while preserving original tokens using stride-2 pairs
+    // Build [lower, original] pairs
+    list pairs = [];
+    integer i = 0; integer n = llGetListLength(L);
+    while(i < n)
+    {
+        string t = llList2String(L,i);
+        string k = llToLower(t);
+        pairs += [k, t];
+        i += 1;
+    }
+    // Sort by the lowercase key using stride=2, ascending=TRUE
+    pairs = llListSort(pairs, 2, TRUE);
+    // Rebuild output taking the original token at index+1
+    list out = [];
+    integer m = llGetListLength(pairs);
+    integer j = 1; // start from value position
+    while(j < m)
+    {
+        out += [ llList2String(pairs, j) ];
+        j += 2;
+    }
+    return out;
+}
+
+integer ensureTypes()
+{
+    // Start async read if needed
+    if(rdTypes == FALSE)
+    {
+        TYPES_RAW = [];
+        TYPES = [];
+        lnTypes = 0;
+        if(llGetInventoryType(NC_TYPES) == INVENTORY_NOTECARD)
+        {
+            rdTypes = TRUE;
+            rqTypes = llGetNotecardLine(NC_TYPES, lnTypes);
+        }
+    }
+    return TRUE;
+}
+
+integer ensureListen()
+{
+    if(L_DLG) llListenRemove(L_DLG);
+    L_DLG = llListen(DLG_CH, "", USER, "");
+    return TRUE;
+}
+
+// ===== Dialog helpers =====
+integer dlg(key k, string msg, list buttons){ llDialog(k, msg, buttons, DLG_CH); return TRUE; }
+
+list pageSlice(list src, integer page, integer per)
+{
+    integer n = llGetListLength(src);
+    if(n <= 0) return [];
+    integer start = page * per;
+    integer end   = start + per - 1;
+    if(start >= n)
+    {
+        start = clampi(n-1, 0, n-1);
+        end   = start;
+    }
+    if(end >= n) end = n - 1;
+    return llList2List(src, start, end);
+}
+
+integer showName()
+{
+    STAGE = "name";
+    ensureListen();
+    return dlg(USER, "Enter a Name in chat: /37 name <YourName>", ["Next","Cancel"]);
+}
+
+integer showBreed()
+{
+    STAGE = "breed";
+    return dlg(USER, "Enter a Breed in chat: /37 breed <Breed>", ["Next","Back","Cancel"]);
+}
+
+integer showGender()
+{
+    STAGE = "gender";
+    return dlg(USER, "Select your Gender.", ["♀","♂","⚥","⚧","Back","Cancel"]);
+}
+
+integer showTypes()
+{
+    STAGE = "types";
+    integer per = 7; // leaves room for 5 control buttons => 12 total
+
+    list page = pageSlice(TYPES, TPAGE, per);
+    list buttons = page + ["> Next", "< Prev", "T2: None", "Done", "Back", "Cancel"];
+
+    integer totalPages = 1;
+    integer n = llGetListLength(TYPES);
+    if(n > per)
+    {
+        integer rem = n % per; integer q = (n - rem) / per; if(rem > 0) q += 1; totalPages = q;
+    }
+
+    string msg = "Select type(s).\nCurrent: T1="+W_T1+"  T2="+W_T2+"\nPage "+(string)(TPAGE+1)+" of "+(string)totalPages;
+    return dlg(USER, msg, buttons);
+}
+
+integer showReview()
+{
+    STAGE = "review";
+    string meta = "META|NAME:"+W_NAME+"|BREED:"+W_BREED+"|GENDER:"+W_GENDER+"|T1:"+W_T1+"|T2:"+W_T2;
+    llMessageLinked(LINK_SET, OP_TITLER_META, meta, USER);
+
+    string msg = "Review\n———\nName: "+W_NAME+"\nBreed: "+W_BREED+"\nGender: "+W_GENDER+"\nType1: "+W_T1+"\nType2: "+W_T2;
+    return dlg(USER, msg, ["Apply","Back","Cancel"]);
+}
+
+integer applyAll()
+{
+    string payload = "NAME:"+W_NAME+"|BREED:"+W_BREED+"|GENDER:"+W_GENDER+"|T1:"+W_T1+"|T2:"+W_T2;
+    llMessageLinked(LINK_SET, OP_SETUP_APPLY, payload, USER);
+    return TRUE;
+}
+
+integer nextFrom(string stage)
+{
+    if(stage == "name") return showBreed();
+    if(stage == "breed") return showGender();
+    if(stage == "gender") return showTypes();
+    if(stage == "types") return showReview();
+    return TRUE;
+}
+
+integer backFrom(string stage)
+{
+    if(stage == "breed") return showName();
+    if(stage == "gender") return showBreed();
+    if(stage == "types") return showGender();
+    if(stage == "review") return showTypes();
+    return TRUE;
+}
+
+integer handleTypeClick(string b)
+{
+    if(b == "> Next"){ TPAGE += 1; return TRUE; }
+    if(b == "< Prev"){ if(TPAGE > 0) TPAGE -= 1; return TRUE; }
+    if(b == "T2: None"){ W_T2 = ""; return TRUE; }
+    if(b == "Done"){ return nextFrom("types"); }
+    if(b == "Back"){ return backFrom("types"); }
+    if(b == "Cancel"){ USER = NULL_KEY; return TRUE; }
+
+    // Real type clicked
+    if(W_T1 == "")
+    {
+        W_T1 = b; return TRUE;
+    }
+    else
+    {
+        if(b != W_T1) W_T2 = b; return TRUE; // fill or replace T2
+    }
+}
+
+integer startFor(key who)
+{
+    USER = who; STAGE = "name"; W_NAME = ""; W_BREED = ""; W_GENDER = ""; W_T1 = ""; W_T2 = ""; TPAGE = 0;
+    ensureTypes();
+    ensureListen();
+    return showName();
+}
+
+// ===== Events =====
+
+default
+{
+    state_entry(){ }
+
+    dataserver(key rq, string data)
+    {
+        if(rq == rqTypes)
+        {
+            if(data == EOF)
+            {
+                rdTypes = FALSE;
+                // finalize TYPES
+                TYPES = sortLower(uniqueLower(TYPES_RAW));
+            }
+            else
+            {
+                string line = trim(data);
+                if(line != "") TYPES_RAW += [line];
+                lnTypes += 1;
+                rqTypes = llGetNotecardLine(NC_TYPES, lnTypes);
+            }
+        }
+    }
+
+    listen(integer ch, string nm, key id, string msg)
+    {
+        if(id != USER) return;
+        if(ch != DLG_CH) return;
+
+        string m = trim(msg);
+        string ml = llToLower(m);
+
+        // Chat entry for name/breed
+        if(startsWith(ml, "name ")){ W_NAME = trim(llGetSubString(m,5,-1)); showBreed(); return; }
+        if(startsWith(ml, "breed ")){ W_BREED = trim(llGetSubString(m,6,-1)); showGender(); return; }
+
+        // Common buttons
+        if(m == "Cancel"){ USER = NULL_KEY; return; }
+        if(m == "Back"){ backFrom(STAGE); return; }
+        if(m == "Next")
+        {
+            if(STAGE == "name"){ nextFrom("name"); return; }
+            if(STAGE == "breed"){ nextFrom("breed"); return; }
+        }
+
+        // Gender picks
+        if(m == "♀" || m == "♂" || m == "⚥" || m == "⚧"){ W_GENDER = m; showTypes(); return; }
+
+        // Types page controls and picks
+        if(m == "> Next" || m == "< Prev" || m == "T2: None" || m == "Done")
+        {
+            handleTypeClick(m); showTypes(); return;
+        }
+
+        // Review / Apply
+        if(m == "Apply"){ applyAll(); USER = NULL_KEY; return; }
+
+        // Otherwise treat as a type button when in types page
+        if(STAGE == "types"){ handleTypeClick(m); showTypes(); return; }
+    }
+
+    link_message(integer from, integer num, string str, key id)
+    {
+        if(num == OP_SETUP_OPEN){ startFor(id); return; }
+    }
+
+    on_rez(integer p){ llResetScript(); }
+    changed(integer c){ if(c & (CHANGED_OWNER | CHANGED_INVENTORY)){ llResetScript(); } }
+}

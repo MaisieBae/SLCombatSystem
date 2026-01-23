@@ -1,0 +1,29 @@
+# LootTable — integer weights (normalized)
+
+# Format: CODE=weight
+
+# Healing
+
+hp10=60
+hp50=30
+hp120=10
+
+# Buffs
+
+satk1=30
+sdef1=30
+def4=7
+atk5=7
+spdf6=6
+spak8=6
+d15=4
+a15=4
+
+# Specials / XP / Affection
+
+sp+1=12
+spmax=6
+rc25=10
+mx80=8
+lvl+=2
+affc=8

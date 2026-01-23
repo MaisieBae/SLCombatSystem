@@ -1,0 +1,194 @@
+// APIBridge RC-1.0 — Project Arousal Link (LSL-safe)
+// ----------------------------------------------------------------------------------
+// Purpose
+//   Bridge creature combat to external systems (Project Arousal) without touching core logic.
+//   - Listens to Combat/Titler signals to maintain a small cached view of state.
+//   - Accepts simple chat/HUD commands and emits sanitized region messages for Arousal.
+//   - Announces milestones (affection max, KO) on a social bus channel.
+//
+// Signals we LISTEN for (from your existing stack):
+//   OP_TITLER_META (7002)    → caches NAME/BREED/GENDER/T1/T2
+//   OP_STATS_TITLER (7001)   → caches HP/HPMax/CH/CHMax/LV/XP/XPNext/INV
+//
+// Region channels:
+//   CH_SOC: Social bus for cross-system announcements (affmax/ko/etc.). Set via GameConfig.
+//   CH_CMD: Optional local command channel for HUD requests (req:ivs, req:statsfull, praise, love, release).
+//
+// LSL safety: no ternary, no break.
+// ----------------------------------------------------------------------------------
+
+// ===== Opcodes =====
+integer OP_STATS_TITLER = 7001; // from CombatCore: "HP:x/y|CH:a/b|LV:n|XP:x/y|INV:n"
+integer OP_TITLER_META  = 7002; // from Titler:      "META|NAME:..|BREED:..|GENDER:..|T1:..|T2:.."
+
+// ===== Config / channels =====
+string  NC_GAME = "GameConfig";   // read CH_SOC, CH_CMD, labels
+integer CH_SOC  = -770077;        // default; can be overridden by notecard
+integer CH_CMD  = 37;             // default owner chat alias (/0037)
+
+string GC_CREATURE_LABEL = "Creature"; // e.g., Mon
+string GC_TRAINER_LABEL  = "Trainer";  // e.g., Tamer
+
+// ===== Cached state =====
+key     gTrainer = NULL_KEY; // owner as trainer
+string  gName = ""; string gBreed = ""; string gGender = "";
+string  gType1 = ""; string gType2 = "";
+integer gLV = 1; integer gXP = 0; integer gXPNext = 0;
+integer gHP = 1; integer gHPMax = 1; integer gCH = 0; integer gCHMax = 0;
+integer gINV = 0; // 1 during invuln
+
+// Optional affection cache (local side-meter; external system may also manage it)
+integer gAff = 0; integer gAffMax = 100; integer gAffStepSmall = 3; integer gAffStepBig = 10;
+
+// ===== Notecard read =====
+key gcReq = NULL_KEY; integer gcLine = 0; integer gcLoad = FALSE;
+
+// ===== Utils =====
+string trim(string s){ return llStringTrim(s, STRING_TRIM); }
+integer clampi(integer v, integer lo, integer hi){ if(v<lo) return lo; if(v>hi) return hi; return v; }
+string kv(list L, string tag){ integer i; integer n=llGetListLength(L); for(i=0;i<n-1;i+=2){ if(llList2String(L,i)==tag) return llList2String(L,i+1); } return ""; }
+
+integer loadGC(){ if(llGetInventoryType(NC_GAME)==INVENTORY_NOTECARD){ gcLoad=TRUE; gcLine=0; gcReq=llGetNotecardLine(NC_GAME,gcLine);} return TRUE; }
+
+integer applyGC(string line)
+{
+    integer p = llSubStringIndex(line, "=");
+    if(p<=0) return FALSE;
+    string k = trim(llGetSubString(line,0,p-1));
+    string v = trim(llGetSubString(line,p+1,-1));
+    if(k=="SOCIAL_CH") CH_SOC = (integer)((float)v);
+    else if(k=="COMBAT_CH") CH_CMD = (integer)((float)v); // if you want a separate HUD channel, add HUD_CH key instead
+    else if(k=="CREATURE_LABEL") GC_CREATURE_LABEL = v;
+    else if(k=="TRAINER_LABEL")  GC_TRAINER_LABEL  = v;
+    else if(k=="AFF_MAX") gAffMax = (integer)((float)v);
+    else if(k=="AFF_STEP_SMALL") gAffStepSmall = (integer)((float)v);
+    else if(k=="AFF_STEP_BIG")   gAffStepBig   = (integer)((float)v);
+    return TRUE;
+}
+
+// ===== Formatters =====
+integer sendIVs(key to)
+{
+    if(to==NULL_KEY) return FALSE;
+    // If you later store IVs in Linkset Data, read: core:iv:HP etc. For now, placeholders 100.
+    integer IV_HP=100, IV_ATK=100, IV_DEF=100, IV_SPA=100, IV_SPD=100, IV_SPE=100, IV_DEX=100;
+    string txt = "[IVs] "+GC_CREATURE_LABEL+" "+gName+"  Lv "+(string)gLV+
+                 "\nHP:"+(string)IV_HP+"  ATK:"+(string)IV_ATK+"  DEF:"+(string)IV_DEF+
+                 "  SPA:"+(string)IV_SPA+"  SPD:"+(string)IV_SPD+"  SPE:"+(string)IV_SPE+"  DEX:"+(string)IV_DEX;
+    llInstantMessage(to, txt);
+    return TRUE;
+}
+
+integer sendFull(key to)
+{
+    if(to==NULL_KEY) return FALSE;
+    string types=gType1; if(gType2!="") types += ","+gType2;
+    string txt = "[Stats] "+GC_CREATURE_LABEL+" "+gName+" ("+gBreed+")  "+gGender+"  Types: "+types+
+                 "\nLv "+(string)gLV+"  HP "+(string)gHP+"/"+(string)gHPMax+"  CH "+(string)gCH+"/"+(string)gCHMax+
+                 "\nXP "+(string)gXP+"  Next "+(string)gXPNext+
+                 "\nAffection to "+GC_TRAINER_LABEL+": "+(string)gAff+"/"+(string)gAffMax;
+    llInstantMessage(to, txt);
+    return TRUE;
+}
+
+integer announceAffMax()
+{
+    if(gTrainer!=NULL_KEY)
+    {
+        string types=gType1; if(gType2!="") types += ","+gType2;
+        llRegionSay(CH_SOC, "affmax|owner:"+(string)gTrainer+"|types:"+types);
+    }
+    return TRUE;
+}
+
+// ===== Commands (HUD/local)
+integer handleCmd(key from, string raw)
+{
+    string m = trim(llToLower(raw));
+    if(m=="praise"){ gAff = clampi(gAff + gAffStepSmall, 0, gAffMax); if(gAff==gAffMax) announceAffMax(); llRegionSayTo(from,0,"Praise noted. ("+(string)gAff+")"); return TRUE; }
+    if(m=="love"){ gAff = clampi(gAff + gAffStepBig, 0, gAffMax); if(gAff==gAffMax) announceAffMax(); llRegionSayTo(from,0,"Love noted. ("+(string)gAff+")"); return TRUE; }
+    if(m=="release"){ llRegionSay(CH_SOC, "release|owner:"+(string)from+"|name:"+gName); llOwnerSay("Released by "+(string)from); return TRUE; }
+
+    // req:ivs[:<key>]
+    integer p = llSubStringIndex(m, ":ivs");
+    if(p==3 && llGetSubString(m,0,2)=="req")
+    {
+        key tgt = from;
+        integer colon = llSubStringIndex(raw, ":");
+        if(colon>=0){ // optional explicit key after second ':'
+            integer second = llSubStringIndex(raw,":ivs:");
+            if(second>=0){ string id = trim(llGetSubString(raw, second+5, -1)); if(id!="") tgt=(key)id; }
+        }
+        return sendIVs(tgt);
+    }
+
+    // req:statsfull[:<key>]
+    p = llSubStringIndex(m, ":statsfull");
+    if(p==3 && llGetSubString(m,0,2)=="req")
+    {
+        key tgt = from;
+        integer second = llSubStringIndex(raw,":statsfull:");
+        if(second>=0){ string id2 = trim(llGetSubString(raw, second+11, -1)); if(id2!="") tgt=(key)id2; }
+        return sendFull(tgt);
+    }
+
+    return FALSE;
+}
+
+// ===== State =====
+default
+{
+    state_entry()
+    {
+        gTrainer = llGetOwner();
+        loadGC();
+        llListen(CH_CMD, "", NULL_KEY, "");
+    }
+
+    on_rez(integer p){ llResetScript(); }
+    changed(integer c){ if(c & CHANGED_OWNER) llResetScript(); }
+
+    dataserver(key q,string data)
+    {
+        if(q!=gcReq) return;
+        if(data==EOF){ gcLoad=FALSE; return; }
+        if(data!="") applyGC(data);
+        gcReq = llGetNotecardLine(NC_GAME, ++gcLine);
+    }
+
+    listen(integer ch, string name, key id, string msg)
+    {
+        if(ch==CH_CMD && id==gTrainer){ handleCmd(id, msg); return; }
+    }
+
+    link_message(integer sender, integer opcode, string str, key k)
+    {
+        if(opcode==OP_TITLER_META)
+        {
+            // META|NAME:..|BREED:..|GENDER:..|T1:..|T2:..
+            list L = llParseString2List(str,["|",":"],[]);
+            string nm = kv(L,"NAME"); if(nm!="") gName = nm;
+            string br = kv(L,"BREED"); if(br!="") gBreed = br;
+            string gd = kv(L,"GENDER"); if(gd!="") gGender = gd;
+            string t1 = kv(L,"T1"); if(t1!="") gType1 = t1;
+            string t2 = kv(L,"T2"); if(t2!="") gType2 = t2;
+            return;
+        }
+        if(opcode==OP_STATS_TITLER)
+        {
+            // HP:x/y|CH:a/b|LV:n|XP:x/y|INV:n
+            list Q = llParseString2List(str,["|", ":", "/"],[]);
+            integer i; integer n = llGetListLength(Q);
+            for(i=0;i<n;i++)
+            {
+                string tag = llList2String(Q,i);
+                if(tag=="HP" && (i+2)<n){ gHP=(integer)llList2String(Q,i+1); gHPMax=(integer)llList2String(Q,i+2); i+=2; }
+                else if(tag=="CH" && (i+2)<n){ gCH=(integer)llList2String(Q,i+1); gCHMax=(integer)llList2String(Q,i+2); i+=2; }
+                else if(tag=="LV" && (i+1)<n){ gLV=(integer)llList2String(Q,i+1); i+=1; }
+                else if(tag=="XP" && (i+2)<n){ gXP=(integer)llList2String(Q,i+1); gXPNext=(integer)llList2String(Q,i+2); i+=2; }
+                else if(tag=="INV" && (i+1)<n){ gINV=(integer)llList2String(Q,i+1); i+=1; }
+            }
+            return;
+        }
+    }
+}

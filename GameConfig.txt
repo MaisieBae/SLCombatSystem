@@ -1,0 +1,59 @@
+# GameConfig — notecard
+
+# Drop this in the root prim. Keys are read by multiple modules.
+
+# LSL comments start with # and are ignored.
+
+# ==== Channels ====
+
+COMBAT\_CH=-370037           # internal Core bus for attacks (do not change unless you know why)
+CH\_GESTURE=69               # player input channel for /69 commands (slapLeft, slapRight, melee <TYPE>, rangedAttack <TYPE>)
+
+# ==== Core timings & regen ====
+
+TIMER\_TICK\_MS=250           # core heartbeat in ms
+REGEN\_HP\_PER\_TICK=0         # passive regen amount per tick (0 = off)
+REST\_REGEN\_MULT=3           # /0037 rest multiplies regen by this amount
+
+# ==== Damage math ====
+
+STAT\_VARIANCE\_PCT=0         # per-creature stat RNG at spawn (±X%)
+DAMAGE\_JITTER\_PCT=0         # per-hit RNG on final damage (±X%)
+CRIT\_MULT=1.5               # crit damage multiplier
+
+# ==== Cooldown / Action bar ====
+
+BASE\_COOLDOWN\_MS=1500       # base cooldown before SPD scaling
+SPD\_COOLDOWN\_MIN\_MS=400     # lower bound after SPD
+SWEET\_WINDOW\_MS=180         # perfect-hit (★) timing window size
+
+# ==== Charge ====
+
+CHARGEMAX=6                 # max charge pips
+CHARGE\_PER\_HIT=1            # normal charge gain on a successful hit
+
+# ==== Parry ====
+
+PARRY\_REDUCE\_MULT=0.5       # damage taken on a successful parry (e.g., 0.5 = 50% damage)
+PARRY\_FALLBACK\_MS=300       # grace window when latency is high
+PARRY\_BONUS\_CAP\_PER=1       # max charge per single parry
+PARRY\_BONUS\_ROLLMAX=2       # total bonus charge allowed in the rolling window
+PARRY\_BONUS\_ROLLSEC=5       # rolling window seconds
+
+# ==== Items / Bag ====
+
+BAG\_MAX\_PER\_ITEM=3          # default per-item carry limit (overridable per item via ItemsConfig limit:)
+
+# ==== FX / HUD ====
+
+LOWHP\_PCT=25                # when HP% <= this, emit LOWHP cue
+HUD\_IDLE\_HIDE=0             # 1 = only show name/level/types when out of combat
+
+# ==== Safety flags ====
+
+DEFAULT\_PROFILE\_ON\_SETUP=1  # 1 = after first successful setup, auto-save to slot A
+TYPES\_LOCK\_ON\_SETUP=1       # 1 = lock Type1/Type2 after first setup
+
+# ==== Versioning ====
+
+API\_VER=1

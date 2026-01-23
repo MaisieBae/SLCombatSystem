@@ -1,0 +1,232 @@
+// AffinityCore RC‑1.0.1 — Type effectiveness + Item Buff totals (combined TypeCore + BuffsCore)
+// -------------------------------------------------------------------------------------------------
+// Purpose
+//   Offload two bulky systems from CombatCore to save memory:
+//     1) TypeChart parsing + effectiveness lookups (Pokemon-like).  Notecard: TypeChart
+//     2) Temporary item buff totals (from ItemsCore OP_ITEM_BUFF)
+//
+// How CombatCore should interact (simple + synchronous reads):
+//   • Effectiveness: read   llLinksetDataRead("aff:eff:"+ATKType)  → "<float>" or ""
+//       - AffinityCore keeps these up-to-date when it knows your own types (via OP_TITLER_META)
+//       - Fallback in CombatCore if empty: treat as 1.0
+//   • Buff multipliers: read llLinksetDataRead("buff:ATK/DEF/SPA/SPD2/SPD/DEX")  → integer percent (can be "")
+//       - BM(stat) = 1.0 + (float)percent/100.0
+//
+// Optional request/response (if you want an ad‑hoc query):
+//   OP_TYPE_REQ  (7600): "ATK:<Type>|T1:<selfT1>|T2:<selfT2>" (T1/T2 optional; defaults to current)
+//   OP_TYPE_REPLY(7601): "EFF:<f>|ATK:<t>|T1:<t1>|T2:<t2>" and also writes Linkset Data key "aff:last_eff"
+//
+// Buff API (listen here, not in CombatCore):
+//   OP_ITEM_BUFF (7102): "ADD|stat:<S>|pct:<p>|dur:<sec>|stacks:<k>"  and  "DROP|stat:<S>|pct:<p>"
+//   We just maintain totals and write to Linkset Data keys buff:*
+//
+// Also listens to OP_TITLER_META (7002) to learn your current types and precompute the per‑ATK map.
+//
+// LSL-safe: no ternary, no break.
+// -------------------------------------------------------------------------------------------------
+
+// ===== Opcodes =====
+integer OP_TITLER_META  = 7002;
+integer OP_ITEM_BUFF    = 7102;
+integer OP_TYPE_REQ     = 7600;
+integer OP_TYPE_REPLY   = 7601;
+
+// ===== Notecards =====
+string NC_TYPE = "TypeChart"; // CSV: Att,Def,Mult
+
+// ===== Internal state =====
+string SELF_T1 = "";
+string SELF_T2 = "";
+
+// Type chart storage: sparse map using two lists of same length
+list TC_KEYS = []; // keys are "Att|Def" title‑cased
+list TC_VALS = []; // float multipliers
+
+// Known attack types set (first column); we derive it while parsing for precompute
+list ATK_TYPES = [];
+
+// Buff totals (integer percent points)
+integer B_ATK=0; integer B_DEF=0; integer B_SPA=0; integer B_SPD2=0; integer B_SPD=0; integer B_DEX=0;
+
+// Notecard read
+key rqType=NULL_KEY; integer lnType=0; integer rdType=FALSE;
+
+// ===== Utils =====
+string trim(string s){ return llStringTrim(s, STRING_TRIM); }
+string tcase(string s){ string a; if(s=="") return s; a=llToLower(s); return llToUpper(llGetSubString(a,0,0))+llGetSubString(a,1,-1); }
+integer idxOf(list L, string v){ integer i; integer n=llGetListLength(L); for(i=0;i<n;i++){ if(llList2String(L,i)==v) return i; } return -1; }
+integer clampi(integer v, integer lo, integer hi){ if(v<lo) return lo; if(v>hi) return hi; return v; }
+
+// ===== Linkset Data helpers =====
+string K_EFF(string atk){ return "aff:eff:"+tcase(trim(atk)); }
+string K_BUFF(string stat){ return "buff:"+stat; }
+
+integer writeEff(string atk, float eff){ llLinksetDataWrite(K_EFF(atk),(string)eff); return TRUE; }
+
+integer writeBuffTotals(){
+    llLinksetDataWrite(K_BUFF("ATK"),(string)B_ATK);
+    llLinksetDataWrite(K_BUFF("DEF"),(string)B_DEF);
+    llLinksetDataWrite(K_BUFF("SPA"),(string)B_SPA);
+    llLinksetDataWrite(K_BUFF("SPD2"),(string)B_SPD2);
+    llLinksetDataWrite(K_BUFF("SPD"),(string)B_SPD);
+    llLinksetDataWrite(K_BUFF("DEX"),(string)B_DEX);
+    return TRUE;
+}
+
+// ===== TypeChart map =====
+integer tcSet(string A, string D, float mult)
+{
+    string k = tcase(A) + "|" + tcase(D);
+    integer i = idxOf(TC_KEYS, k);
+    if(i < 0){ TC_KEYS += [k]; TC_VALS += [mult]; }
+    else { TC_VALS = llListReplaceList(TC_VALS, [mult], i, i); }
+    // Track known attack types
+    if(idxOf(ATK_TYPES, tcase(A)) < 0) ATK_TYPES += [tcase(A)];
+    return TRUE;
+}
+
+float tcGet(string A, string D)
+{
+    string k = tcase(A) + "|" + tcase(D);
+    integer i = idxOf(TC_KEYS, k);
+    if(i < 0) return 1.0; // default neutral
+    return (float)llList2Float(TC_VALS, i);
+}
+
+float eff2(string A, string T1, string T2)
+{
+    float e1 = tcGet(A, T1);
+    if(T2 == "" || T2 == "-") return e1;
+    float e2 = tcGet(A, T2);
+    return e1 * e2;
+}
+
+integer precomputeAll()
+{
+    // If we know our types, precompute eff for every attack type we saw in the notecard
+    if(SELF_T1 == "" && SELF_T2 == "") return FALSE;
+    integer i; integer n = llGetListLength(ATK_TYPES);
+    for(i=0;i<n;i++){
+        string a = llList2String(ATK_TYPES, i);
+        float e = eff2(a, SELF_T1, SELF_T2);
+        writeEff(a, e);
+    }
+    return TRUE;
+}
+
+integer startType(){
+    TC_KEYS = []; TC_VALS = []; ATK_TYPES = [];
+    if(llGetInventoryType(NC_TYPE) == INVENTORY_NOTECARD){ rdType=TRUE; lnType=0; rqType=llGetNotecardLine(NC_TYPE, lnType); }
+    return TRUE;
+}
+
+integer applyType(string line)
+{
+    string ln = trim(line);
+    if(ln == "") return FALSE; if(llGetSubString(ln,0,0) == "#") return FALSE;
+    list L = llParseString2List(ln, [",","\t"], []);
+    if(llGetListLength(L) < 3) return FALSE;
+    string A = tcase(llList2String(L,0));
+    string D = tcase(llList2String(L,1));
+    string M = trim(llList2String(L,2));
+    float mv = (float)M;
+    tcSet(A, D, mv);
+    return TRUE;
+}
+
+// ===== Buff handling =====
+integer buffAddDrop(string kind, string stat, integer pct)
+{
+    string S = llToUpper(stat);
+    integer p = pct;
+    if(S == "ATK"){ if(kind=="ADD") B_ATK+=p; else B_ATK-=p; }
+    else if(S == "DEF"){ if(kind=="ADD") B_DEF+=p; else B_DEF-=p; }
+    else if(S == "SPA"){ if(kind=="ADD") B_SPA+=p; else B_SPA-=p; }
+    else if(S == "SPD2"){ if(kind=="ADD") B_SPD2+=p; else B_SPD2-=p; }
+    else if(S == "SPD"){ if(kind=="ADD") B_SPD+=p; else B_SPD-=p; }
+    else if(S == "DEX"){ if(kind=="ADD") B_DEX+=p; else B_DEX-=p; }
+
+    // soft clamps
+    if(B_ATK<-100) B_ATK=-100; if(B_DEF<-100) B_DEF=-100; if(B_SPA<-100) B_SPA=-100; if(B_SPD2<-100) B_SPD2=-100; if(B_SPD<-100) B_SPD=-100; if(B_DEX<-100) B_DEX=-100;
+    if(B_ATK>300) B_ATK=300;   if(B_DEF>300) B_DEF=300;   if(B_SPA>300) B_SPA=300;   if(B_SPD2>300) B_SPD2=300;   if(B_SPD>300) B_SPD=300;   if(B_DEX>300) B_DEX=300;
+
+    writeBuffTotals();
+    return TRUE;
+}
+
+// ===== Handlers =====
+integer handleTypeReq(string payload)
+{
+    list P = llParseString2List(payload, ["|",":"], []);
+    string A = tcase(llList2String(P, llListFindList(P, ["ATK"]) + 1));
+    string T1 = tcase(llList2String(P, llListFindList(P, ["T1"]) + 1));
+    string T2 = tcase(llList2String(P, llListFindList(P, ["T2"]) + 1));
+    if(T1 == "") T1 = SELF_T1; if(T2 == "") T2 = SELF_T2;
+    float e = eff2(A, T1, T2);
+    llLinksetDataWrite("aff:last_eff", (string)e);
+    string reply = "EFF:"+(string)e+"|ATK:"+A+"|T1:"+T1+"|T2:"+T2;
+    llMessageLinked(LINK_SET, OP_TYPE_REPLY, reply, NULL_KEY);
+    // Also cache into per-ATK slot if this matches our local types
+    if(T1 == SELF_T1 && T2 == SELF_T2){ writeEff(A, e); }
+    return TRUE;
+}
+
+integer handleTitlerMeta(string payload)
+{
+    list P = llParseString2List(payload, ["|",":"], []);
+    string t1 = tcase(llList2String(P, llListFindList(P, ["T1"]) + 1));
+    string t2 = tcase(llList2String(P, llListFindList(P, ["T2"]) + 1));
+    if(t1 != "" || t2 != ""){
+        SELF_T1 = t1; SELF_T2 = t2;
+        precomputeAll(); // writes aff:eff:<ATK>
+    }
+    return TRUE;
+}
+
+integer handleItemBuff(string payload)
+{
+    list P = llParseString2List(payload, ["|",":"], []);
+    integer i; integer n = llGetListLength(P);
+    string action=""; string stat=""; integer pct=0;
+    for(i=0;i<n-1;i+=2){ string a = llList2String(P,i); string b = llList2String(P,i+1);
+        if(a=="ADD" || a=="DROP") action=a; else if(a=="stat") stat=b; else if(a=="pct") pct=(integer)((float)b);
+    }
+    if(action==""){ action = llGetSubString(payload,0,3); if(action!="ADD" && action!="DROP") action=""; }
+    if(action!="" && stat!=""){ buffAddDrop(action, stat, pct); }
+    return TRUE;
+}
+
+// ===== State =====
+default
+{
+    state_entry()
+    {
+        // Load TypeChart
+        startType();
+        // Export initial buff totals (0s on first run)
+        writeBuffTotals();
+    }
+
+    changed(integer c)
+    {
+        if(c & CHANGED_INVENTORY){ startType(); }
+    }
+
+    dataserver(key rq, string data)
+    {
+        if(rq == rqType)
+        {
+            if(data == EOF){ rdType = FALSE; rqType = NULL_KEY; precomputeAll(); return; }
+            if(data != ""){ applyType(data); }
+            rqType = llGetNotecardLine(NC_TYPE, ++lnType);
+            return;
+        }
+    }
+
+    link_message(integer sender, integer opcode, string payload, key k)
+    {
+        if(opcode == OP_TITLER_META){ if(llSubStringIndex(payload,"META")==0){ handleTitlerMeta(payload); } return; }
+        if(opcode == OP_ITEM_BUFF){ handleItemBuff(payload); return; }
+        if(opcode == OP_TYPE_REQ){ handleTypeReq(payload); return; }
+    }
+}

@@ -1,0 +1,156 @@
+// Parry_Core RC-1.0 — lightweight timed parry window
+// ----------------------------------------------------------------------------------
+// Purpose
+//   Provide a tiny, memory-safe parry system separate from CombatCore.
+//   - Opens a short input window when the player triggers "parry" (via /69 or OP_PARRY_OPEN).
+//   - When CombatCore is about to apply damage, it queries us (OP_PARRY_QUERY).
+//   - We reply immediately with OP_PARRY_RESULT: success or fail, and optional bonus info.
+//   - Emits FX cues on success/fail; Core stays authoritative for damage/INV/etc.
+//
+// Wire-up (simple):
+//   • Gesture: owner types /69 parry  → opens a parry window.
+//   • Core: before applying damage, send OP_PARRY_QUERY; if reply says OK:1, Core negates/reduces dmg.
+//   • Optional: Another script may pre-open via OP_PARRY_OPEN (e.g., items/skills).
+//
+// LSL-safe: no ternary, no break.
+// ----------------------------------------------------------------------------------
+
+// ===== Channels & Opcodes =====
+integer CH_GESTURE = 69; // /69 parry
+
+integer OP_FX            = 7300; // → FX_Core CUE:...
+integer OP_PARRY_OPEN    = 7500; // ← request to open a parry window (payload optional)
+integer OP_PARRY_QUERY   = 7501; // ← CombatCore asks if a parry is active now
+integer OP_PARRY_RESULT  = 7502; // → reply: "OK:1|bonus:<n>" or "OK:0"
+
+// ===== Config =====
+string  NC_GAME = "GameConfig"; // optional: PARRY_WINDOW_MS, PARRY_COOLDOWN_MS, PARRY_BONUS
+integer PARRY_WINDOW_MS   = 600;  // default 600 ms active window
+integer PARRY_COOLDOWN_MS = 1500; // min delay between opens
+integer PARRY_BONUS       = 1;    // bonus charge or similar (Core decides meaning)
+
+// ===== State =====
+integer gActive = FALSE;
+float   gUntil  = 0.0;
+float   gNext   = 0.0; // earliest next open (cooldown)
+
+// ===== Utils =====
+string trim(string s){ return llStringTrim(s, STRING_TRIM); }
+float nowf(){ return llGetTime(); }
+integer now(){ return llGetUnixTime(); }
+
+integer msToSec1000(integer ms){ // convert ms → seconds as float (prec at 0.001s)
+    float f = (float)ms / 1000.0;
+    if(f < 0.001) f = 0.001;
+    llSetTimerEvent(0.1); // ensure timer runs while windows are active
+    return TRUE;
+}
+
+integer canOpen(){ if(nowf() < gNext) return FALSE; return TRUE; }
+
+integer openWindow(integer ms)
+{
+    float dur = (float)ms / 1000.0;
+    if(dur < 0.05) dur = 0.05;
+    gActive = TRUE;
+    gUntil = nowf() + dur;
+    if(nowf() + 2.0 > gNext) gNext = nowf() + ((float)PARRY_COOLDOWN_MS / 1000.0);
+    llMessageLinked(LINK_SET, OP_FX, "CUE:PARRY_READY", NULL_KEY);
+    llSetTimerEvent(0.05);
+    return TRUE;
+}
+
+integer closeWindow(){ gActive = FALSE; gUntil = 0.0; return TRUE; }
+
+integer parseOpenPayload(string payload)
+{
+    // accepts: "ms:<n>|bonus:<n>" (all optional)
+    integer ms = PARRY_WINDOW_MS;
+    integer bonus = PARRY_BONUS;
+    list L = llParseString2List(payload, ["|",":"], []);
+    integer i; integer n = llGetListLength(L);
+    for(i=0;i<n-1;i+=2){
+        string a = llList2String(L,i);
+        string b = llList2String(L,i+1);
+        if(a=="ms") ms = (integer)((float)b);
+        else if(a=="bonus") bonus = (integer)((float)b);
+    }
+    PARRY_BONUS = bonus; // apply to replies while active
+    if(canOpen()) openWindow(ms);
+    return TRUE;
+}
+
+integer replyResult(integer ok)
+{
+    string msg;
+    if(ok){
+        msg = "OK:1|bonus:" + (string)PARRY_BONUS;
+        llMessageLinked(LINK_SET, OP_FX, "CUE:PARRY_SUCCESS", NULL_KEY);
+        closeWindow();
+    } else {
+        msg = "OK:0";
+    }
+    llMessageLinked(LINK_SET, OP_PARRY_RESULT, msg, NULL_KEY);
+    return TRUE;
+}
+
+// ===== Notecard read (optional) =====
+key rqGC = NULL_KEY; integer lnGC = 0; integer rdGC = FALSE;
+integer startGC(){ if(llGetInventoryType(NC_GAME)==INVENTORY_NOTECARD){ rdGC=TRUE; lnGC=0; rqGC=llGetNotecardLine(NC_GAME, lnGC);} return TRUE; }
+integer applyGC(string line)
+{
+    integer p = llSubStringIndex(line, "=");
+    if(p<=0) return FALSE;
+    string k = trim(llGetSubString(line,0,p-1));
+    string v = trim(llGetSubString(line,p+1,-1));
+    if(k=="PARRY_WINDOW_MS")   PARRY_WINDOW_MS   = (integer)((float)v);
+    else if(k=="PARRY_COOLDOWN_MS") PARRY_COOLDOWN_MS = (integer)((float)v);
+    else if(k=="PARRY_BONUS")  PARRY_BONUS  = (integer)((float)v);
+    return TRUE;
+}
+
+// ===== State =====
+default
+{
+    state_entry()
+    {
+        startGC();
+        llListen(CH_GESTURE, "", llGetOwner(), "");
+        llSetTimerEvent(0.0);
+    }
+
+    on_rez(integer p){ llResetScript(); }
+    changed(integer c){ if(c & CHANGED_OWNER) llResetScript(); }
+
+    dataserver(key rq, string data)
+    {
+        if(rq==rqGC){ if(data==EOF){ rdGC=FALSE; rqGC=NULL_KEY; return; } if(data!="") applyGC(data); rqGC=llGetNotecardLine(NC_GAME, ++lnGC); return; }
+    }
+
+    // Owner gesture: /69 parry
+    listen(integer ch, string name, key id, string msg)
+    {
+        if(ch==CH_GESTURE && id==llGetOwner()){
+            string m = trim(llToLower(msg));
+            if(m=="parry"){ if(canOpen()) openWindow(PARRY_WINDOW_MS); return; }
+        }
+    }
+
+    // Linkage with Core
+    link_message(integer sender, integer opcode, string payload, key k)
+    {
+        if(opcode==OP_PARRY_OPEN){ parseOpenPayload(payload); return; }
+        if(opcode==OP_PARRY_QUERY){
+            integer ok = FALSE;
+            if(gActive){ if(nowf() <= gUntil) ok = TRUE; }
+            replyResult(ok);
+            return;
+        }
+    }
+
+    timer()
+    {
+        if(gActive && nowf() > gUntil){ closeWindow(); llSetTimerEvent(0.0); }
+        else if(!gActive){ llSetTimerEvent(0.0); }
+    }
+}

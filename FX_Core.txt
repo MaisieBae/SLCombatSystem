@@ -1,0 +1,295 @@
+// ItemsCore RC-2.1 — LSL-clean, data-driven items + dig loot + per-item caps
+// ----------------------------------------------------------------------------------
+// Purpose
+//   • Data-driven item definitions via ItemsConfig notecard (CODE=key:val|key:val|...).
+//   • Per-item carry caps (global BAG_MAX_PER_ITEM from GameConfig, per-item override via limit:).
+//   • HEAL/BUFF/CHARGE/AFF dispatched to other modules; XP/CLEANSE/SHIELD/DOT/CUSTOM forwarded for satellites.
+//   • /0037 bag, /0037 use <CODE>, /0037 dig supported.
+// Notes
+//   • LSL-safe: no ternary operator, no 'break;', light parsing and small payloads.
+//   • This replaces RC-2.0; prior canvas was marked bad/corrupt by user.
+// ----------------------------------------------------------------------------------
+
+// ===== Opcodes to other modules =====
+integer OP_FX           = 7300;   // → FX_Core        : CUE:...
+integer OP_FX_RELOAD    = 7301;   // → FX_Core        : reload
+integer OP_ITEM_HEAL    = 7101;   // → CombatCore     : HEAL|code:<c>|amt:<n>
+integer OP_ITEM_BUFF    = 7105;   // → AffinityCore   : ADD|stat:<S>|pct:<p>|dur:<sec>|stacks:<k>|code:<c>
+integer OP_ITEM_CHARGE  = 7102;   // → CombatCore     : CHARGE|amt:<n>|code:<c>
+integer OP_ITEM_AFF     = 7103;   // → APIBridge/addon: AFF|amt:<n>|code:<c>
+integer OP_ITEM_XP      = 7104;   // → XP_Core        : XP|amt:<n>|code:<c>
+integer OP_ITEM_ACT     = 7110;   // → Addons generic : code:<c>|<full payload>
+
+// ===== Channels / Config =====
+integer CH_CMD = 37;              // /0037 owner command channel
+string  NC_GAME  = "GameConfig";   // provides BAG_MAX_PER_ITEM (global default)
+string  NC_ITEMS = "ItemsConfig";  // item definitions (data-driven)
+string  NC_LOOT  = "LootTable";    // weighted loot for dig
+
+integer BAG_MAX_PER_ITEM = 1;     // default (overridable)
+
+// ===== Data stores =====
+// Items map: code -> raw payload string (key:val|key:val|...)
+list G_CODES = [];     // [code, payload, code, payload, ...]
+
+// Loot table entries: [code, weight, ...]
+list G_LOOT = [];
+integer G_LOOT_TOTAL = 0;
+
+// ===== Helpers =====
+string trim(string s){ return llStringTrim(s, STRING_TRIM); }
+string lower(string s){ return llToLower(s); }
+integer clampi(integer v, integer lo, integer hi){ if(v<lo) return lo; if(v>hi) return hi; return v; }
+string kv(list L, string tag){ integer i; integer n=llGetListLength(L); for(i=0;i<n-1;i+=2){ if(llList2String(L,i)==tag) return llList2String(L,i+1); } return ""; }
+
+// Linkset Data keys
+string BK(string code){ return "bag:"+code; }
+string CFG(string k){ return "cfg:"+k; }
+
+// Parse a payload "k:v|k:v|..." into a list [k,v,k,v,...]
+list parseKV(string payload){ return llParseString2List(payload,["|",":"],[]); }
+
+integer itemLimitFor(list kvlist){
+    string v = kv(kvlist, "limit");
+    if(v != "") return (integer)((float)v);
+    string g = llLinksetDataRead(CFG("bag_max_per_item"));
+    if(g != "") return (integer)((float)g);
+    return BAG_MAX_PER_ITEM;
+}
+
+integer bagCount(string code){ string v=llLinksetDataRead(BK(code)); if(v=="") return 0; return (integer)((float)v); }
+integer bagSet(string code, integer n){ if(n<=0){ llLinksetDataDelete(BK(code)); return 0; } else { llLinksetDataWrite(BK(code),(string)n); return n; } }
+
+integer itemExists(string code){ return (llListFindList(G_CODES,[code])!=-1); }
+string  itemPayload(string code){ integer i=llListFindList(G_CODES,[code]); if(i==-1) return ""; return llList2String(G_CODES,i+1); }
+
+integer addItemDef(string code, string payload){
+    integer i = llListFindList(G_CODES,[code]);
+    if(i==-1){ G_CODES += [code, payload]; }
+    else { G_CODES = llListReplaceList(G_CODES, [payload], i+1, i+1); }
+    return TRUE;
+}
+
+integer lootAdd(string code, integer wt){ if(wt<=0) return FALSE; G_LOOT += [code, wt]; G_LOOT_TOTAL += wt; return TRUE; }
+
+string lootRoll(){
+    if(G_LOOT_TOTAL<=0) return "";
+    float r = llFrand((float)G_LOOT_TOTAL);
+    integer i; integer n = llGetListLength(G_LOOT);
+    integer acc = 0;
+    for(i=0;i<n;i+=2){
+        string c = llList2String(G_LOOT,i);
+        integer w = llList2Integer(G_LOOT,i+1);
+        acc += w;
+        if(r < (float)acc) return c;
+    }
+    return llList2String(G_LOOT, 0);
+}
+
+integer fx(string cue){ if(cue!="") llMessageLinked(LINK_SET, OP_FX, cue, NULL_KEY); return TRUE; }
+
+integer tell(key to, string msg){ if(to!=NULL_KEY) llRegionSayTo(to, 0, msg); return TRUE; }
+
+// ===== Using an item =====
+integer useItem(string code, key who)
+{
+    string payload = itemPayload(code);
+    if(payload == ""){ tell(who, "Unknown item: "+code); return FALSE; }
+
+    list L = parseKV(payload);
+    string cat = lower(kv(L, "cat"));
+    string act = lower(kv(L, "act"));
+    string nm  = kv(L, "name");
+    string cue = kv(L, "cue");
+
+    integer amt  = 0; string vAmt = kv(L, "amt"); if(vAmt!="") amt=(integer)((float)vAmt);
+    integer pct  = 0; string vPct = kv(L, "pct"); if(vPct!="") pct=(integer)((float)vPct);
+    integer dur  = 0; string vDur = kv(L, "dur"); if(vDur!="") dur=(integer)((float)vDur);
+    integer stacks = 0; string vStk = kv(L, "stacks"); if(vStk!="") stacks=(integer)((float)vStk);
+    string stat = kv(L, "stat"); // ATK/DEF/SPA/SPD2/SPD/DEX
+
+    // Consume from bag first (if consumable; default 1)
+    integer consumable = 1; string vCons = kv(L, "consumable"); if(vCons!="") consumable=(integer)((float)vCons);
+    if(consumable){
+        integer have = bagCount(code);
+        if(have<=0){ string disp = nm; if(disp=="") disp = code; tell(who, "You don't have any "+disp+"."); return FALSE; }
+        bagSet(code, have-1);
+    }
+
+    // Dispatch based on act/cat
+    if(act=="heal" || cat=="heal"){
+        string msg = "HEAL|code:"+code+"|amt:"+(string)amt;
+        llMessageLinked(LINK_SET, OP_ITEM_HEAL, msg, NULL_KEY);
+        if(cue=="") cue = "CUE:HEAL";
+        fx(cue);
+    }
+    else if(act=="buff" || cat=="buff"){
+        if(stat=="") stat = "ATK";
+        string b = "ADD|stat:"+stat+"|pct:"+(string)pct+"|dur:"+(string)dur+"|stacks:"+(string)stacks+"|code:"+code;
+        llMessageLinked(LINK_SET, OP_ITEM_BUFF, b, NULL_KEY);
+        if(cue=="") cue = "CUE:BUFF_"+stat;
+        fx(cue);
+    }
+    else if(act=="charge" || cat=="charge"){
+        string cmsg = "CHARGE|amt:"+(string)amt+"|code:"+code;
+        llMessageLinked(LINK_SET, OP_ITEM_CHARGE, cmsg, NULL_KEY);
+    }
+    else if(act=="aff" || cat=="aff"){
+        string amsg = "AFF|amt:"+(string)amt+"|code:"+code;
+        llMessageLinked(LINK_SET, OP_ITEM_AFF, amsg, NULL_KEY);
+    }
+    else if(act=="xp" || cat=="xp"){
+        string xmsg = "XP|amt:"+(string)amt+"|code:"+code;
+        llMessageLinked(LINK_SET, OP_ITEM_XP, xmsg, NULL_KEY);
+    }
+    else if(act=="cleanse" || cat=="cleanse" || act=="shield" || cat=="shield" || act=="dot" || cat=="dot" || act=="custom" || cat=="custom"){
+        string full = "code:"+code+"|"+payload;
+        llMessageLinked(LINK_SET, OP_ITEM_ACT, full, NULL_KEY);
+        if(cue!="") fx(cue);
+    }
+    else {
+        string full2 = "code:"+code+"|"+payload;
+        llMessageLinked(LINK_SET, OP_ITEM_ACT, full2, NULL_KEY);
+        if(cue!="") fx(cue);
+    }
+
+    if(nm=="") nm = code;
+    tell(who, "Used "+nm+".");
+    return TRUE;
+}
+
+// ===== Pickup / grant API =====
+// External scripts can grant items via link msg: opcode OP_ITEM_ACT with payload "give|code:<C>|amt:<N>"
+integer grantItem(string code, integer amt, key who)
+{
+    if(!itemExists(code)){ tell(who, "Unknown item code: "+code); return FALSE; }
+    integer have = bagCount(code);
+    list L = parseKV(itemPayload(code));
+    integer lim = itemLimitFor(L);
+    integer can = lim - have; if(can < 0) can = 0;
+    if(can <= 0){ tell(who, "Bag full for "+code+" (limit "+(string)lim+")."); return FALSE; }
+    if(amt > can) amt = can;
+    bagSet(code, have + amt);
+    string nm = kv(L, "name"); if(nm=="") nm = code;
+    tell(who, "+"+(string)amt+" x "+nm+" ("+(string)(have+amt)+"/"+(string)lim+")");
+    return TRUE;
+}
+
+// ===== Loot: dig =====
+integer digOnce(key who)
+{
+    string code = lootRoll();
+    if(code == ""){ tell(who, "You found nothing."); return FALSE; }
+    return grantItem(code, 1, who);
+}
+
+// ===== Notecard loads =====
+key rqGame=NULL_KEY; integer lnGame=0; integer rdGame=FALSE;
+key rqItems=NULL_KEY; integer lnItems=0; integer rdItems=FALSE;
+key rqLoot=NULL_KEY; integer lnLoot=0; integer rdLoot=FALSE;
+
+integer startGame(){ if(llGetInventoryType(NC_GAME)==INVENTORY_NOTECARD){ rdGame=TRUE; lnGame=0; rqGame=llGetNotecardLine(NC_GAME, lnGame);} return TRUE; }
+integer startItems(){ if(llGetInventoryType(NC_ITEMS)==INVENTORY_NOTECARD){ rdItems=TRUE; lnItems=0; rqItems=llGetNotecardLine(NC_ITEMS, lnItems);} return TRUE; }
+integer startLoot(){ if(llGetInventoryType(NC_LOOT)==INVENTORY_NOTECARD){ rdLoot=TRUE; lnLoot=0; rqLoot=llGetNotecardLine(NC_LOOT, lnLoot);} return TRUE; }
+
+integer applyGame(string line){
+    integer p = llSubStringIndex(line, "="); if(p<=0) return FALSE;
+    string k = trim(llGetSubString(line,0,p-1));
+    string v = trim(llGetSubString(line,p+1,-1));
+    if(k=="BAG_MAX_PER_ITEM"){ BAG_MAX_PER_ITEM = (integer)((float)v); llLinksetDataWrite(CFG("bag_max_per_item"),(string)BAG_MAX_PER_ITEM); }
+    return TRUE;
+}
+
+integer applyItemLine(string line)
+{
+    string s = trim(line);
+    if(s=="" || llGetSubString(s,0,0)=="#") return FALSE;
+    integer p = llSubStringIndex(s, "=");
+    if(p<=0) return FALSE;
+    string code = trim(llGetSubString(s,0,p-1));
+    string rest = trim(llGetSubString(s,p+1,-1));
+    if(code=="" || rest=="") return FALSE;
+    addItemDef(code, rest);
+    return TRUE;
+}
+
+integer applyLootLine(string line)
+{
+    string s = trim(line);
+    if(s=="" || llGetSubString(s,0,0)=="#") return FALSE;
+    // Accept formats: CODE=wt  |  CODE wt  |  CODE
+    integer p = llSubStringIndex(s, "=");
+    string code; integer wt;
+    if(p>0){ code = trim(llGetSubString(s,0,p-1)); wt = (integer)((float)trim(llGetSubString(s,p+1,-1))); }
+    else {
+        list L = llParseString2List(s, [" ", "\t"], []);
+        code = llList2String(L,0);
+        if(llGetListLength(L)>1) wt = (integer)((float)llList2String(L,1)); else wt = 1;
+    }
+    if(code=="") return FALSE;
+    lootAdd(code, wt);
+    return TRUE;
+}
+
+// ===== UI helpers =====
+integer listBag(key who)
+{
+    integer i; integer n = llGetListLength(G_CODES);
+    integer shown = 0;
+    for(i=0;i<n;i+=2){
+        string code = llList2String(G_CODES,i);
+        integer have = bagCount(code);
+        if(have>0){
+            list L = parseKV(llList2String(G_CODES,i+1));
+            string nm = kv(L, "name"); if(nm=="") nm = code;
+            tell(who, nm+" x "+(string)have);
+            shown = 1;
+        }
+    }
+    if(!shown) tell(who, "Your bag is empty.");
+    return TRUE;
+}
+
+// ===== State =====
+default
+{
+    state_entry()
+    {
+        startGame(); startItems(); startLoot();
+        llListen(CH_CMD, "", llGetOwner(), "");
+    }
+
+    on_rez(integer p){ llResetScript(); }
+    changed(integer c){ if(c & CHANGED_OWNER) llResetScript(); if(c & CHANGED_INVENTORY){ startGame(); startItems(); startLoot(); } }
+
+    dataserver(key rq, string data)
+    {
+        if(rq==rqGame){ if(data==EOF){ rdGame=FALSE; rqGame=NULL_KEY; return; } if(data!="") applyGame(data); rqGame=llGetNotecardLine(NC_GAME, ++lnGame); return; }
+        if(rq==rqItems){ if(data==EOF){ rdItems=FALSE; rqItems=NULL_KEY; return; } if(data!="") applyItemLine(data); rqItems=llGetNotecardLine(NC_ITEMS, ++lnItems); return; }
+        if(rq==rqLoot){ if(data==EOF){ rdLoot=FALSE; rqLoot=NULL_KEY; return; } if(data!="") applyLootLine(data); rqLoot=llGetNotecardLine(NC_LOOT, ++lnLoot); return; }
+    }
+
+    // Owner commands on /0037
+    listen(integer ch, string name, key id, string msg)
+    {
+        if(ch!=CH_CMD || id!=llGetOwner()) return;
+        string m = lower(trim(msg));
+        if(m=="bag"){ listBag(id); return; }
+        if(llSubStringIndex(m, "use ")==0){ string code = trim(llGetSubString(msg, 4, -1)); if(code!="") useItem(code, id); return; }
+        if(m=="dig"){ digOnce(id); return; }
+    }
+
+    // External grant via generic opcode
+    link_message(integer sender, integer opcode, string payload, key k)
+    {
+        if(opcode==OP_ITEM_ACT){
+            // grant via: give|code:<C>|amt:<N>
+            if(llSubStringIndex(payload, "give|") == 0){
+                list L = llParseString2List(payload,["|",":"],[]);
+                string code = kv(L, "code");
+                integer amt = (integer)((float)kv(L, "amt")); if(amt<=0) amt=1;
+                grantItem(code, amt, k);
+            }
+        }
+    }
+}

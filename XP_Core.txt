@@ -1,0 +1,130 @@
+// XP_Core RC-1.0 — parses ExpCurve notecard and answers Core with XPMAX
+// Link API:
+//   ← OP_XP_REQ   payload: "LV:<n>"
+//   → OP_XP_REPLY payload: "XPMAX:<n>"
+// Linkset Data keys written:
+//   xp:mode, xp:base, xp:per, xp:growth, xp:loser_pct, xp:lv:<n>
+// Notes: LSL-safe (no ternary, no break), keeps memory tiny by writing table rows to Linkset Data.
+
+integer OP_XP_REQ   = 7400;
+integer OP_XP_REPLY = 7401;
+
+string NC_XP = "ExpCurve";
+
+// local cache (tiny)
+string XP_MODE = "FORMULA"; // or "TABLE"
+float  XP_BASE = 50.0;
+float  XP_PER  = 25.0;      // also accepts XP_PER_LEVEL
+float  XP_GROWTH = 0.0;     // 0.10 = +10% per level
+integer LOSER_PCT = 5;      // consolation XP %
+
+key rqXP = NULL_KEY; integer lnXP = 0; integer rdXP = FALSE;
+
+string K(string k){ return "xp:" + k; }
+
+integer applyXP(string line)
+{
+    integer p = llSubStringIndex(line, "=");
+    if(p <= 0) return FALSE;
+    string k = llStringTrim(llGetSubString(line,0,p-1), STRING_TRIM);
+    string v = llStringTrim(llGetSubString(line,p+1,-1), STRING_TRIM);
+
+    if(k == "MODE"){ XP_MODE = v; llLinksetDataWrite(K("mode"), XP_MODE); return TRUE; }
+    if(k == "XP_BASE"){ XP_BASE = (float)v; llLinksetDataWrite(K("base"), (string)XP_BASE); return TRUE; }
+    if(k == "XP_PER" || k == "XP_PER_LEVEL"){ XP_PER = (float)v; llLinksetDataWrite(K("per"), (string)XP_PER); return TRUE; }
+    if(k == "XP_GROWTH"){ XP_GROWTH = (float)v; llLinksetDataWrite(K("growth"), (string)XP_GROWTH); return TRUE; }
+    if(k == "LOSER_PCT"){ LOSER_PCT = (integer)((float)v); llLinksetDataWrite(K("loser_pct"), (string)LOSER_PCT); return TRUE; }
+
+    // TABLE entries: LV<n>=<value>
+    if(llGetSubString(k,0,1) == "LV"){
+        integer lvl = (integer)((float)llGetSubString(k,2,-1));
+        if(lvl > 0){
+            llLinksetDataWrite(K("lv:" + (string)lvl), v);
+            if(XP_MODE == ""){ XP_MODE = "TABLE"; llLinksetDataWrite(K("mode"), "TABLE"); }
+        }
+        return TRUE;
+    }
+    return FALSE;
+}
+
+integer startXP()
+{
+    if(llGetInventoryType(NC_XP)==INVENTORY_NOTECARD){
+        rdXP = TRUE; lnXP = 0; rqXP = llGetNotecardLine(NC_XP, lnXP);
+        return TRUE;
+    }
+    // defaults if no card
+    llLinksetDataWrite(K("mode"), XP_MODE);
+    llLinksetDataWrite(K("base"), (string)XP_BASE);
+    llLinksetDataWrite(K("per"), (string)XP_PER);
+    llLinksetDataWrite(K("growth"), (string)XP_GROWTH);
+    llLinksetDataWrite(K("loser_pct"), (string)LOSER_PCT);
+    return FALSE;
+}
+
+integer xpNextFor(integer level)
+{
+    // TABLE first
+    if(llToUpper(XP_MODE) == "TABLE"){
+        string v = llLinksetDataRead(K("lv:" + (string)level));
+        if(v != "") return (integer)llRound((float)v);
+        // fallback to last defined lower level
+        integer probe = level;
+        while(probe > 0){
+            v = llLinksetDataRead(K("lv:" + (string)probe));
+            if(v != "") return (integer)llRound((float)v);
+            probe -= 1;
+        }
+        // fall through to formula if no table entries at all
+    }
+
+    // FORMULA or fallback
+    float L = (float)level;
+    float inc = XP_PER;
+    float grow = XP_GROWTH;
+    float base = XP_BASE;
+    float scaledInc;
+
+    if(grow <= 0.0) scaledInc = (L - 1.0) * inc;
+    else scaledInc = (L - 1.0) * inc * llPow(1.0 + grow, (L - 1.0));
+
+    integer need = (integer)llRound(base + scaledInc);
+    if(need < 1) need = 1;
+    return need;
+}
+
+integer handleReq(string payload)
+{
+    list P = llParseString2List(payload, ["|",":"], []);
+    integer L = 1; integer i; integer n = llGetListLength(P);
+    for(i=0;i<n-1;i+=2){ string a = llList2String(P,i); string b = llList2String(P,i+1); if(a == "LV") L = (integer)((float)b); }
+    integer need = xpNextFor(L);
+    string out = "XPMAX:" + (string)need;
+    llMessageLinked(LINK_SET, OP_XP_REPLY, out, NULL_KEY);
+    return TRUE;
+}
+
+default
+{
+    state_entry(){ startXP(); }
+
+    changed(integer c){ if(c & CHANGED_INVENTORY){ startXP(); } }
+
+    dataserver(key rq, string data)
+    {
+        if(rq == rqXP){
+            if(data == EOF){ rdXP = FALSE; rqXP = NULL_KEY; return; }
+            if(data != ""){
+                string t = llStringTrim(data, STRING_TRIM);
+                if(t != "" && llGetSubString(t,0,0) != "#") applyXP(t);
+            }
+            rqXP = llGetNotecardLine(NC_XP, ++lnXP);
+            return;
+        }
+    }
+
+    link_message(integer s, integer op, string p, key k)
+    {
+        if(op == OP_XP_REQ){ handleReq(p); return; }
+    }
+}

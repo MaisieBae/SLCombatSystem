@@ -1,0 +1,41 @@
+# ItemsConfig — data-driven items for ItemsCore RC-2.1
+
+# Syntax: CODE = cat:<category>|act:<action>|key\:val|...
+
+# Known cats/acts (v1): heal/buff/charge/aff/xp/cleanse/shield/dot/custom
+
+# Optional keys: amt, pct, stat(ATK|DEF|SPA|SPD2|SPD|DEX), dur(sec), stacks, limit, name, cue, consumable(0/1)
+
+# --- Healing ---
+
+hp10   = cat\:heal|act\:heal|amt:10|name\:HP Restore|cue\:CUE\:HEAL\_SMALL
+hp50   = cat\:heal|act\:heal|amt:50|name\:Max Potion|cue\:CUE\:HEAL\_BIG
+hp120  = cat\:heal|act\:heal|amt:120|name\:Hyper Potion|cue\:CUE\:HEAL
+
+# --- Small buffs (1% for 60s) ---
+
+satk1  = cat\:buff|act\:buff|stat\:ATK|pct:1 |dur:60 |stacks:3|name\:Small Attack Booster|cue\:CUE\:BUFF\_ATK
+sdef1  = cat\:buff|act\:buff|stat\:DEF|pct:1 |dur:60 |stacks:3|name\:Small Defense Booster|cue\:CUE\:BUFF\_DEF
+
+# --- Mid buffs ---
+
+def4   = cat\:buff|act\:buff|stat\:DEF|pct:4 |dur:90 |stacks:3|name:+4% Defense|cue\:CUE\:BUFF\_DEF
+atk5   = cat\:buff|act\:buff|stat\:ATK|pct:5 |dur:90 |stacks:3|name:+5% Attack|cue\:CUE\:BUFF\_ATK
+spdf6  = cat\:buff|act\:buff|stat\:SPD2|pct:6 |dur:120|stacks:3|name:+6% Sp.Def|cue\:CUE\:BUFF\_SPD2
+spak8  = cat\:buff|act\:buff|stat\:SPA |pct:8 |dur:120|stacks:3|name:+8% Sp.Atk|cue\:CUE\:BUFF\_SPA
+
+# --- Big buffs (shorter) ---
+
+d15    = cat\:buff|act\:buff|stat\:DEF|pct:15|dur:45 |stacks:2|name:+15% Defense|cue\:CUE\:BUFF\_DEF
+a15    = cat\:buff|act\:buff|stat\:ATK|pct:15|dur:45 |stacks:2|name:+15% Attack|cue\:CUE\:BUFF\_ATK
+
+# --- Charge / Special / XP / Affection ---
+
+sp+1   = cat\:charge |act\:charge|amt:1 |name\:Special Recovery|cue\:CUE\:CHARGE
+spmax  = cat\:charge |act\:charge|amt:4 |name\:Plush Comfy Pillow|cue\:CUE\:CHARGE   # tune to CHARGEMAX
+
+rc25   = cat\:xp     |act\:xp    |amt:25|name\:Rare Candy|cue\:CUE\:XP\_GAIN
+mx80   = cat\:xp     |act\:xp    |amt:80|name\:Max Candy|cue\:CUE\:XP\_GAIN
+lvl+   = cat\:custom |act\:custom|name\:Level Up|payload\:award\:levelup|cue\:CUE\:LEVELUP   # forwarded to addon/XP\_Core hook
+
+affc   = cat\:aff    |act\:aff   |amt:1 |name\:Affection Candy|cue\:CUE\:AFFECTION

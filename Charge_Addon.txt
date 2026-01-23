@@ -1,0 +1,84 @@
+// Charge_Addon RC-1.0 — CHARGE handler for ItemsCore (LSL-safe)
+// -------------------------------------------------------------------------------------------------
+// Purpose
+//   • Listens for CHARGE messages from ItemsCore and adjusts CH/CHMAX safely.
+//   • Keeps CombatCore lean; does not touch combat math or cooldowns.
+//   • Pushes a Titler refresh after applying.
+// Contracts
+//   • ItemsCore must send:  OP_ITEM_CHARGE (suggested 7106)  payload: "CHARGE|amt:<n>|code:<c>"
+//   • Titler expects OP_STATS_TITLER (7001): "HP:x/y|CH:a/b|LV:n|XP:x/y[|INV:0/1]"
+//   • FX optional cue via OP_FX (7300), e.g., "CUE:CHARGE".
+// Notes
+//   • LSL safe: no ternary, no stray break; simple helpers.
+//   • If your current ItemsCore still uses 7102 for CHARGE, change OP_ITEM_CHARGE below to match.
+// -------------------------------------------------------------------------------------------------
+
+integer OP_ITEM_CHARGE = 7106;   // ← ItemsCore (set this to your chosen CHARGE opcode)
+integer OP_STATS_TITLER = 7001;  // → Titler
+integer OP_FX           = 7300;  // → FX_Core (optional)
+
+// Linkset Data keys used by CombatCore
+string CK(string k){ return "core:"+k; }
+
+integer clampi(integer v, integer lo, integer hi){ if(v<lo) return lo; if(v>hi) return hi; return v; }
+string kv(list P, string tag){ integer i; integer n=llGetListLength(P); for(i=0;i<n-1;i+=2){ if(llList2String(P,i)==tag) return llList2String(P,i+1);} return ""; }
+string trim(string s){ return llStringTrim(s, STRING_TRIM); }
+
+integer pushTitler(){
+    // Read current core values and emit a unified stats line
+    integer HP=(integer)((float)llLinksetDataRead(CK("HP")));
+    integer HPMAX=(integer)((float)llLinksetDataRead(CK("HPMAX")));
+    integer CH=(integer)((float)llLinksetDataRead(CK("CH")));
+    integer CHMAX=(integer)((float)llLinksetDataRead(CK("CHMAX")));
+    integer LV=(integer)((float)llLinksetDataRead(CK("LV")));
+    integer XP=(integer)((float)llLinksetDataRead(CK("XP")));
+    integer XPMAX=(integer)((float)llLinksetDataRead(CK("XPMAX")));
+    integer INV=(integer)((float)llLinksetDataRead(CK("INV")));
+
+    string msg = "HP:"+(string)HP+"/"+(string)HPMAX+"|CH:"+(string)CH+"/"+(string)CHMAX+"|LV:"+(string)LV+"|XP:"+(string)XP+"/"+(string)XPMAX+"|INV:"+(string)INV;
+    llMessageLinked(LINK_SET, OP_STATS_TITLER, msg, NULL_KEY);
+    return TRUE;
+}
+
+integer applyCharge(integer amt)
+{
+    integer chmax; integer ch;
+    string v;
+    v = llLinksetDataRead(CK("CHMAX")); if(v != "") chmax = (integer)((float)v); else chmax = 4;
+    v = llLinksetDataRead(CK("CH"));   if(v != "") ch = (integer)((float)v); else ch = 0;
+
+    integer n = ch + amt;
+    if(n < 0) n = 0;
+    if(n > chmax) n = chmax;
+
+    llLinksetDataWrite(CK("CH"), (string)n);
+
+    // Optional FX cue
+    llMessageLinked(LINK_SET, OP_FX, "CUE:CHARGE", NULL_KEY);
+
+    pushTitler();
+    return TRUE;
+}
+
+integer handleCharge(string payload)
+{
+    // payload: "CHARGE|amt:<n>|code:<c>"
+    list P = llParseString2List(payload, ["|",":"], []);
+    string op = trim(llList2String(P,0));
+    if(op != "CHARGE") return FALSE;
+    string vAmt = kv(P, "amt");
+    integer amt = 0; if(vAmt != "") amt = (integer)((float)vAmt);
+    return applyCharge(amt);
+}
+
+
+default
+{
+    link_message(integer from, integer num, string str, key id)
+    {
+        if(num == OP_ITEM_CHARGE){ handleCharge(str); }
+    }
+
+    on_rez(integer p){ llResetScript(); }
+    changed(integer c){ if(c & (CHANGED_OWNER | CHANGED_INVENTORY)){ llResetScript(); } }
+}

@@ -1,0 +1,246 @@
+// CoreMenuProfiles RC-1.5 — IVs view, confirm reset, current slot + autosave
+// ----------------------------------------------------------------------------------
+// Changes from RC-1.4
+//  • Adds an "IVs" button to display per-stat IV multipliers (reads Linkset Data core:iv:*).
+//  • Adds a confirmation step for Full Reset to avoid accidental presses.
+//  • Tracks a CURRENT_SLOT (A–I). Load/Save/Delete set it; future Setup_Wizard can set it via opcode.
+//  • On META or STATS updates, auto-saves CURRENT_SLOT (lightweight) if set.
+//  • On first META after setup, if slot A is empty and cfg:default_saved!=1, auto-save slot A and set flag.
+//  • LSL-safe; no ternary, no break.
+// ----------------------------------------------------------------------------------
+
+// ===== Opcodes (align with rest of system) =====
+integer OP_FACTORY_REQ    = 7900; // → all: factory reset
+integer OP_GET_STATS      = 7901; // ← Profiles asks Core
+integer OP_STATS_REPLY    = 7902; // → Core replies with stats text
+integer OP_PROFILES_OPEN  = 7903; // ← Core asks us to open menu for user (key in k)
+integer OP_TITLER_META    = 7002; // ← HUD sends META|NAME:..|T1:..|T2:..
+
+// Profiles helper (future wizard can set the slot explicitly)
+integer OP_PROFILES_SET_SLOT = 7960; // payload: A..I
+
+// FX admin
+integer OP_FX_RELOAD     = 7301; // → FX_Core reload
+
+// ===== UI state =====
+integer MENU_LIS = 0;      // listen handle
+integer MENU_CH  = 0;      // channel
+key     MENU_USER = NULL_KEY; // current user
+
+// ===== Storage guard =====
+integer SAFE_FREE_BYTES = 16384; // reserve 16 KiB headroom in Linkset Data
+
+// ===== Helpers =====
+string trim(string s){ return llStringTrim(s, STRING_TRIM); }
+string CK(string k){ return "core:"+k; }        // for reading current core fields
+string PK(string slot, string k){ return "prof:"+slot+":"+k; } // stored profile keys
+string CFG(string k){ return "cfg:"+k; }
+
+// Slots list A–I
+list SLOTS = ["A","B","C","D","E","F","G","H","I"];
+
+// Fields we persist per profile slot (keep small to avoid mem bloat)
+list FIELDS = [
+    "LV","XP","XPMAX",
+    "HP","HPMAX",
+    "ATK","DEF","SPA","SPD2","SPD","DEX",
+    "SELF_NAME","SELF_T1","SELF_T2"
+    // Gender could be added later when HUD sends it in META
+];
+
+integer clampi(integer v, integer lo, integer hi){ if(v<lo) return lo; if(v>hi) return hi; return v; }
+
+// Track the currently targeted slot (affects autosave)
+string CURRENT_SLOT = ""; // "A".."I"
+integer DID_DEFAULT_SAVE = FALSE; // set after we auto-save A once
+
+integer uiStart(key who){
+    if(MENU_LIS) llListenRemove(MENU_LIS);
+    MENU_CH = -(100000 + (integer)llFrand(900000.0));
+    MENU_LIS = llListen(MENU_CH, "", who, "");
+    MENU_USER = who;
+    return TRUE;
+}
+
+integer uiStop(){
+    if(MENU_LIS) llListenRemove(MENU_LIS);
+    MENU_LIS = 0; MENU_CH = 0; MENU_USER = NULL_KEY;
+    return TRUE;
+}
+
+integer dlgMain(){
+    list btn = ["Load","Save","Delete","Stats","IVs","FX Reload","Reset ▶","Close"];
+    string slotdisp = CURRENT_SLOT; if(slotdisp=="") slotdisp = "-";
+    llDialog(MENU_USER, "Profiles (slot: "+slotdisp+")", btn, MENU_CH);
+    return TRUE;
+}
+
+integer dlgConfirmReset(){
+    list btn = ["Yes, reset","Back"];
+    llDialog(MENU_USER, "Confirm full reset? This will wipe current core state.", btn, MENU_CH);
+    return TRUE;
+}
+
+// ===== Profile I/O =====
+integer profSave(string slot){
+    integer free = llLinksetDataAvailable();
+    if(free < SAFE_FREE_BYTES){
+        llRegionSayTo(MENU_USER,0, "Cannot save: Linkset Data nearly full ("+(string)free+" bytes free).");
+        return FALSE;
+    }
+    integer i; integer n = llGetListLength(FIELDS);
+    for(i=0;i<n;i++){
+        string f = llList2String(FIELDS,i);
+        string val = llLinksetDataRead(CK(f));
+        if(val != "") llLinksetDataWrite(PK(slot,f), val);
+    }
+    llRegionSayTo(MENU_USER,0, "Saved slot "+slot+".");
+    return TRUE;
+}
+
+integer profLoad(string slot){
+    integer i; integer n = llGetListLength(FIELDS);
+    integer wrote = 0;
+    for(i=0;i<n;i++){
+        string f = llGetSubString(llList2String(FIELDS,i),0,-1);
+        string val = llLinksetDataRead(PK(slot,f));
+        if(val != ""){ llLinksetDataWrite(CK(f), val); wrote = 1; }
+    }
+    if(wrote){
+        // Nudge Core to refresh its cached state & HUD
+        llMessageLinked(LINK_SET, OP_GET_STATS, "PUSH", MENU_USER);
+        llRegionSayTo(MENU_USER,0, "Loaded slot "+slot+".");
+    } else {
+        llRegionSayTo(MENU_USER,0, "Slot "+slot+" is empty.");
+    }
+    return TRUE;
+}
+
+integer profDelete(string slot){
+    integer i; integer n = llGetListLength(FIELDS);
+    for(i=0;i<n;i++){
+        string f = llList2String(FIELDS,i);
+        llLinksetDataDelete(PK(slot,f));
+    }
+    llRegionSayTo(MENU_USER,0, "Deleted slot "+slot+".");
+    // If we deleted the current slot, clear the marker
+    if(slot == CURRENT_SLOT) CURRENT_SLOT = "";
+    return TRUE;
+}
+
+integer isValidSlot(string s){ return (llListFindList(SLOTS, [s]) != -1); }
+
+integer chooseSlot(string op){
+    list btn = [];
+    integer i; integer n = llGetListLength(SLOTS);
+    for(i=0;i<n;i++){
+        string s = llList2String(SLOTS,i);
+        btn += [op+" "+s];
+    }
+    btn += ["Back"]; // total 10 buttons (A–I + Back)
+    llDialog(MENU_USER, op+" which slot?", btn, MENU_CH);
+    return TRUE;
+}
+
+// Parse commands like "Load X" / "Save X" / "Delete X"
+integer handleSlotAction(string m){
+    string mm = trim(m);
+    integer sp = llSubStringIndex(mm, " ");
+    if(sp <= 0) return FALSE;
+    string op = llGetSubString(mm, 0, sp-1);
+    string slot = llGetSubString(mm, sp+1, -1);
+    if(!isValidSlot(slot)) return FALSE;
+
+    // Update CURRENT_SLOT on any explicit action
+    CURRENT_SLOT = slot;
+
+    if(op == "Load"){ profLoad(slot); dlgMain(); return TRUE; }
+    if(op == "Save"){ profSave(slot); dlgMain(); return TRUE; }
+    if(op == "Delete"){ profDelete(slot); dlgMain(); return TRUE; }
+    return FALSE;
+}
+
+// ===== Utility: show IVs =====
+integer showIVs(){
+    float ivHP = (float)llLinksetDataRead(CK("iv:HP"));
+    float ivATK = (float)llLinksetDataRead(CK("iv:ATK"));
+    float ivDEF = (float)llLinksetDataRead(CK("iv:DEF"));
+    float ivSPA = (float)llLinksetDataRead(CK("iv:SPA"));
+    float ivSPD2= (float)llLinksetDataRead(CK("iv:SPD2"));
+    float ivSPD = (float)llLinksetDataRead(CK("iv:SPD"));
+    float ivDEX = (float)llLinksetDataRead(CK("iv:DEX"));
+    // Compose a compact line (avoid precision noise)
+    string s = "IVs  HP:"+(string)llRound(ivHP*100.0)+"%  ATK:"+(string)llRound(ivATK*100.0)+"%  DEF:"+(string)llRound(ivDEF*100.0)+"%  SPA:"+(string)llRound(ivSPA*100.0)+"%  SPD2:"+(string)llRound(ivSPD2*100.0)+"%  SPD:"+(string)llRound(ivSPD*100.0)+"%  DEX:"+(string)llRound(ivDEX*100.0)+"%";
+    llRegionSayTo(MENU_USER,0,s);
+    return TRUE;
+}
+
+// ===== Auto-save helpers =====
+integer autoSaveCurrent(){ if(CURRENT_SLOT=="") return FALSE; profSave(CURRENT_SLOT); return TRUE; }
+
+// ===== State =====
+default
+{
+    state_entry(){ }
+
+    // Open only when Core signals it, with the requester in key k
+    link_message(integer sender, integer opcode, string payload, key k)
+    {
+        if(opcode == OP_PROFILES_OPEN){ if(payload == "OPEN"){ uiStart(k); dlgMain(); } return; }
+
+        if(opcode == OP_STATS_REPLY){
+            // Show a trimmed preview of stats when requested
+            if(k == MENU_USER){ string msg = trim(payload); if(msg != "") llRegionSayTo(MENU_USER, 0, msg); }
+            // Auto-save current slot after a stats update
+            autoSaveCurrent();
+            return;
+        }
+
+        if(opcode == OP_TITLER_META){
+            // On any META change (name/types), auto-save current slot
+            autoSaveCurrent();
+            // One-time default save to slot A after initial setup
+            if(!DID_DEFAULT_SAVE){
+                string flag = llLinksetDataRead(CFG("default_saved"));
+                if(flag == ""){ // not yet
+                    string probe = llLinksetDataRead(PK("A","LV"));
+                    if(probe == ""){ // empty → save A
+                        profSave("A");
+                        DID_DEFAULT_SAVE = TRUE;
+                        llLinksetDataWrite(CFG("default_saved"),"1");
+                    }
+                } else { DID_DEFAULT_SAVE = TRUE; }
+            }
+            return;
+        }
+
+        if(opcode == OP_PROFILES_SET_SLOT){
+            string s = trim(payload);
+            if(isValidSlot(s)) CURRENT_SLOT = s;
+            return;
+        }
+    }
+
+    listen(integer ch, string name, key id, string msg)
+    {
+        if(ch != MENU_CH || id != MENU_USER) return;
+        string m = trim(msg);
+        if(m == "Close"){ uiStop(); return; }
+        if(m == "Back"){ dlgMain(); return; }
+
+        if(m == "Stats"){ llMessageLinked(LINK_SET, OP_GET_STATS, "REQ", MENU_USER); return; }
+        if(m == "IVs"){ showIVs(); dlgMain(); return; }
+        if(m == "FX Reload"){ llMessageLinked(LINK_SET, OP_FX_RELOAD, "RELOAD", MENU_USER); llRegionSayTo(MENU_USER,0,"FX reloaded."); dlgMain(); return; }
+
+        if(m == "Reset ▶"){ dlgConfirmReset(); return; }
+        if(m == "Yes, reset"){ llMessageLinked(LINK_SET, OP_FACTORY_REQ, "REQ", MENU_USER); llRegionSayTo(MENU_USER,0,"Factory reset requested."); uiStop(); return; }
+
+        if(m == "Load" || m == "Save" || m == "Delete"){ chooseSlot(m); return; }
+
+        // Slot actions (A–I)
+        if(handleSlotAction(m)) return;
+    }
+
+    on_rez(integer p){ uiStop(); }
+    changed(integer c){ if(c & CHANGED_OWNER){ uiStop(); } }
+}

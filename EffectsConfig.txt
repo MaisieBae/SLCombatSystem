@@ -1,0 +1,44 @@
+# EffectsConfig — notecard
+
+# Maps logical cues to sound/particle presets. FX\_Core reads this.
+
+# Format: CUE=key\:val|key\:val|...
+
+# Known keys: sfx:<soundNameOrUUID>|vol:<0..1>|pitch:<0.5..2.0>|pt:<presetName>|dur:<sec>
+
+# Hits
+
+CUE\:HIT      = sfx\:hit\_light|vol:0.9|pt\:hit\_spark|dur:1
+CUE\:CRIT     = sfx\:hit\_crit |vol:1.0|pt\:crit\_flash|dur:1
+CUE\:DODGE    = sfx\:whoosh   |vol:0.8|pt\:dodge\_swirl|dur:1
+
+# States / Utility
+
+CUE\:REST     = sfx\:rest     |vol:0.6|pt\:rest\_ring  |dur:2
+CUE\:LOWHP    = sfx\:alarm    |vol:0.7|pt\:lowhp\_pulse|dur:2
+CUE\:LEVELUP  = sfx\:levelup  |vol:1.0|pt\:levelup\_burst|dur:2
+CUE\:KO       = sfx\:ko       |vol:1.0|pt\:ko\_fall    |dur:2
+
+# Healing / Buffs
+
+CUE\:HEAL         = sfx\:heal      |vol:0.9|pt\:heal\_glow|dur:1
+CUE\:HEAL\_SMALL   = sfx\:heal\_s    |vol:0.8|pt\:heal\_glow|dur:1
+CUE\:HEAL\_BIG     = sfx\:heal\_l    |vol:1.0|pt\:heal\_glow|dur:1
+CUE\:BUFF\_ATK     = sfx\:buff\_up   |vol:0.9|pt\:buff\_up  |dur:1
+CUE\:BUFF\_DEF     = sfx\:buff\_up   |vol:0.9|pt\:buff\_up  |dur:1
+CUE\:BUFF\_SPA     = sfx\:buff\_up   |vol:0.9|pt\:buff\_up  |dur:1
+CUE\:BUFF\_SPD2    = sfx\:buff\_up   |vol:0.9|pt\:buff\_up  |dur:1
+
+# Parry / Combo
+
+CUE\:PARRY\_SUCCESS = sfx\:parry     |vol:1.0|pt\:parry\_ring|dur:1
+CUE\:COMBO\_READY   = sfx\:ready     |vol:0.8|pt\:ready\_glint|dur:1
+CUE\:COMBO\_HIT     = sfx\:combo     |vol:1.0|pt\:combo\_flash|dur:1
+
+# XP gain (from items)
+
+CUE\:XP\_GAIN   = sfx\:xp\_gain  |vol:0.8|pt\:xp\_spark|dur:1
+
+# Affection
+
+CUE\:AFFECTION = sfx\:heart    |vol:0.8|pt\:heart\_burst|dur:1
