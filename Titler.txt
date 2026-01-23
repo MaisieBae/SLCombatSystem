@@ -1,0 +1,454 @@
+// Titler RC-1.0 — Multi-prim display integrated with Combat System
+// -------------------------------------------------------------------------------------------------
+// Purpose:
+//   Displays creature stats using the 5-prim text layer system while integrating with
+//   CombatCore via link messages (OP_STATS_TITLER, OP_TITLER_META, OP_COOLDOWN)
+//
+// Display Layout (5 linked prims):
+//   Prim 2 (white): Name, Breed/Gender/Level, Type, decorative line
+//   Prim 1 (red):   Invulnerability indicator (●)
+//   Prim 3 (black): Secondary indicator (○)
+//   Prim 4 (green): HP bar (▀ blocks)
+//   Prim 5 (gray):  ᴴᴾ: label and charge/XP display
+//
+// Setup:
+//   /99 setup     - Start guided setup (name, gender, level, breed, type)
+//   /99 name X    - Set display name
+//   /99 breed X   - Set breed name
+//   /99 gender X  - Set gender (female/male/herm/nonbinary)
+//   /99 level X   - Set level
+//   /99 type X    - Set type(s)
+//
+// LSL-safe: no ternary, no break
+// -------------------------------------------------------------------------------------------------
+
+// ===== Opcodes from Combat System =====
+integer OP_STATS_TITLER = 7001; // ← Core/CombatCore: HP:<n>/<n>|CH:<n>/<n>|LV:<n>|XP:<n>/<n>|INV:<n>
+integer OP_TITLER_META  = 7002; // → Core/CombatCore: META|NAME:<s>|T1:<s>|T2:<s>
+integer OP_COOLDOWN     = 7010; // ← CombatCore: CD|p:<n>|sweet:<n>|combo:<n>
+
+// ===== Display State =====
+// User-configured (persistent)
+string inputName = "";           // Breed name (e.g., "Pikachu")
+string inputGender = "";         // Gender symbol
+string inputLevel = "1";         // Display level
+string inputDisplayName = "";   // Creature's nickname
+string inputType = "";           // Type string (e.g., "Electric")
+
+// Combat stats (from link messages)
+integer HP = 30; integer HPMAX = 30;
+integer CHARGE = 0; integer CHARGEMAX = 4;
+integer LV = 1;
+integer XP = 0; integer XPMAX = 100;
+integer INVULN = 0;
+integer CD_PCT = 0;       // Cooldown percentage (0-100)
+integer SWEET = 0;        // Sweet spot active
+integer COMBO = 0;        // Combo count
+
+// Display formatting
+string healthbit = "▀";
+string green_line = "▀▀▀▀▀▀▀▀▀▀";
+
+// Listen state
+integer listenHandle = 0;
+integer listenSetup = 0;
+integer dialogStage = 0;
+key owner = NULL_KEY;
+
+// ===== Utils =====
+string trim(string s){ return llStringTrim(s, STRING_TRIM); }
+string tcase(string s){ if(s=="") return s; string a=llToLower(s); return llToUpper(llGetSubString(a,0,0))+llGetSubString(a,1,-1); }
+integer safeInt(string s){ s=trim(s); if(s=="") return 0; return (integer)((float)s); }
+
+// KV parser with bounds checking
+string kvGet(list parts, string tag){ 
+    integer i; integer n=llGetListLength(parts); 
+    if(n < 2) return "";
+    for(i=0;i<n-1;i+=2){ 
+        if(i+1 >= n) return "";
+        if(llList2String(parts,i)==tag) return llList2String(parts,i+1); 
+    } 
+    return ""; 
+}
+
+// ===== Display Updates =====
+integer updateMainText(){
+    string white;
+    // Build display: DisplayName\nBreed Gender Lv.Level\nType\nDecorative
+    white = inputDisplayName + "\n" +
+            inputName + inputGender + " Lᵥ." + inputLevel + "\n" +
+            inputType + "\n" +
+            "◥▃▃▃▃▃▃▃▃▃▃▃▃  ◓";
+    
+    llSetLinkPrimitiveParamsFast(2, [PRIM_TEXT, white, <1,1,1>, 1]);
+    return TRUE;
+}
+
+integer updateHPBar(){
+    // Calculate how many blocks to show (scale HP to 10 blocks)
+    integer blocks = 0;
+    if(HPMAX > 0){
+        blocks = (HP * 10) / HPMAX;
+        if(blocks < 0) blocks = 0;
+        if(blocks > 10) blocks = 10;
+    }
+    
+    green_line = "";
+    integer i;
+    for(i = 0; i < blocks; ++i){
+        green_line += healthbit;
+    }
+    // Fill remaining with spaces
+    for(i = blocks; i < 10; ++i){
+        green_line += "  ";
+    }
+    
+    llSetLinkPrimitiveParamsFast(4, [PRIM_TEXT, "\n    " + green_line, <0,1,0>, 1]);
+    return TRUE;
+}
+
+integer updateStatsBar(){
+    // Bottom gray line shows HP:actual/max and charge/XP info
+    string stats = "\n    ᴴᴾ:" + (string)HP + "/" + (string)HPMAX + 
+                   "  ᶜʰ:" + (string)CHARGE + "/" + (string)CHARGEMAX +
+                   "  ˣᵖ:" + (string)XP + "/" + (string)XPMAX + "                               ∙";
+    
+    llSetLinkPrimitiveParamsFast(5, [PRIM_TEXT, stats, <0.4,0.4,0.4>, 1]);
+    return TRUE;
+}
+
+integer updateInvulnIndicator(){
+    // Red dot (●) flashes when invulnerable
+    vector color = <1,0,0>;
+    float alpha = 1.0;
+    
+    if(INVULN){
+        // Flash effect
+        alpha = 0.5 + 0.5 * llSin(llGetTime() * 10.0); // Pulse between 0.5 and 1.0
+        color = <1,0.3,0>; // Orange when invuln
+    }
+    
+    llSetLinkPrimitiveParamsFast(1, [PRIM_TEXT, "\n                                      ●", color, alpha]);
+    return TRUE;
+}
+
+integer updateCooldownIndicator(){
+    // Black dot (○) shows cooldown/combo status
+    string text = "\n                                      ○";
+    vector color = <0,0,0>;
+    float alpha = 1.0;
+    
+    if(SWEET){
+        // Yellow when in sweet spot
+        color = <1,1,0>;
+        alpha = 0.8 + 0.2 * llSin(llGetTime() * 15.0); // Fast pulse
+    }
+    else if(CD_PCT < 100){
+        // Dim while on cooldown
+        alpha = (float)CD_PCT / 100.0;
+    }
+    
+    if(COMBO > 0){
+        // Show combo count
+        text = "\n                                  " + (string)COMBO + "×○";
+    }
+    
+    llSetLinkPrimitiveParamsFast(3, [PRIM_TEXT, text, color, alpha]);
+    return TRUE;
+}
+
+integer updateAllDisplays(){
+    updateMainText();
+    updateHPBar();
+    updateStatsBar();
+    updateInvulnIndicator();
+    updateCooldownIndicator();
+    return TRUE;
+}
+
+// ===== Setup Dialogs =====
+integer setupListens(){
+    if(listenHandle) llListenRemove(listenHandle);
+    if(listenSetup) llListenRemove(listenSetup);
+    
+    owner = llGetOwner();
+    listenSetup = llListen(99, "", owner, "");
+    return TRUE;
+}
+
+integer handleSetupDialog(string message){
+    string lower = llToLower(message);
+    
+    // Start setup wizard
+    if(lower == "setup"){
+        dialogStage = 1;
+        llTextBox(owner, "Enter the Creature Breed (e.g., Pikachu):", 99);
+        return TRUE;
+    }
+    
+    // Setup stages
+    if(dialogStage == 1){
+        inputName = message;
+        dialogStage = 2;
+        list opts = ["Female", "Male", "Herm", "Nonbinary"];
+        llDialog(owner, "Select gender:", opts, 99);
+        return TRUE;
+    }
+    
+    if(dialogStage == 2){
+        string g = llToLower(message);
+        if(g == "female") inputGender = " ♀";
+        else if(g == "male") inputGender = " ♂";
+        else if(g == "herm" || g == "hermaphrodite") inputGender = " ⚥";
+        else if(g == "nonbinary") inputGender = " ⚧";
+        else {
+            list opts = ["Female", "Male", "Herm", "Nonbinary"];
+            llDialog(owner, "Invalid. Select gender:", opts, 99);
+            return TRUE;
+        }
+        
+        dialogStage = 3;
+        llTextBox(owner, "Enter level (number will be overridden by combat system):", 99);
+        return TRUE;
+    }
+    
+    if(dialogStage == 3){
+        inputLevel = message;
+        dialogStage = 4;
+        llTextBox(owner, "Enter the creature's nickname:", 99);
+        return TRUE;
+    }
+    
+    if(dialogStage == 4){
+        inputDisplayName = message;
+        dialogStage = 5;
+        llTextBox(owner, "Enter type(s) - e.g., 'Electric' or 'Fire/Flying':", 99);
+        return TRUE;
+    }
+    
+    if(dialogStage == 5){
+        inputType = message;
+        dialogStage = 0;
+        updateAllDisplays();
+        sendMetaToCombat();
+        llOwnerSay("Setup complete! Stats will update from combat system.");
+        return TRUE;
+    }
+    
+    // Direct commands
+    if(llSubStringIndex(lower, "name ") == 0){
+        inputDisplayName = llGetSubString(message, 5, -1);
+        updateAllDisplays();
+        sendMetaToCombat();
+        return TRUE;
+    }
+    
+    if(llSubStringIndex(lower, "breed ") == 0){
+        inputName = llGetSubString(message, 6, -1);
+        updateAllDisplays();
+        return TRUE;
+    }
+    
+    if(llSubStringIndex(lower, "gender ") == 0){
+        string g = llToLower(llGetSubString(message, 7, -1));
+        if(g == "female") inputGender = " ♀";
+        else if(g == "male") inputGender = " ♂";
+        else if(g == "herm" || g == "hermaphrodite") inputGender = " ⚥";
+        else if(g == "nonbinary") inputGender = " ⚧";
+        updateAllDisplays();
+        return TRUE;
+    }
+    
+    if(llSubStringIndex(lower, "level ") == 0){
+        inputLevel = llGetSubString(message, 6, -1);
+        updateAllDisplays();
+        return TRUE;
+    }
+    
+    if(llSubStringIndex(lower, "type ") == 0){
+        inputType = llGetSubString(message, 5, -1);
+        updateAllDisplays();
+        sendMetaToCombat();
+        return TRUE;
+    }
+    
+    return FALSE;
+}
+
+// ===== Combat System Integration =====
+integer sendMetaToCombat(){
+    // Send META info to Combat system
+    // Parse type string for T1/T2
+    string T1 = "";
+    string T2 = "";
+    
+    integer slash = llSubStringIndex(inputType, "/");
+    if(slash > 0){
+        T1 = tcase(trim(llGetSubString(inputType, 0, slash-1)));
+        T2 = tcase(trim(llGetSubString(inputType, slash+1, -1)));
+    }
+    else {
+        T1 = tcase(trim(inputType));
+    }
+    
+    string meta = "META|NAME:" + inputDisplayName + "|T1:" + T1 + "|T2:" + T2;
+    llMessageLinked(LINK_SET, OP_TITLER_META, meta, NULL_KEY);
+    return TRUE;
+}
+
+integer handleStatsUpdate(string payload){
+    // Parse: HP:<n>/<n>|CH:<n>/<n>|LV:<n>|XP:<n>/<n>|INV:<n>
+    list parts = llParseString2List(payload, ["|", ":", "/"], []);
+    
+    string hpStr = kvGet(parts, "HP");
+    string chStr = kvGet(parts, "CH");
+    string lvStr = kvGet(parts, "LV");
+    string xpStr = kvGet(parts, "XP");
+    string invStr = kvGet(parts, "INV");
+    
+    // Parse HP (value/max format)
+    integer idx = llSubStringIndex(hpStr, "/");
+    if(idx > 0){
+        HP = safeInt(llGetSubString(hpStr, 0, idx-1));
+        HPMAX = safeInt(llGetSubString(hpStr, idx+1, -1));
+    }
+    else if(hpStr != ""){
+        // Just HP value, find max separately
+        HP = safeInt(hpStr);
+    }
+    
+    // Parse CHARGE
+    idx = llSubStringIndex(chStr, "/");
+    if(idx > 0){
+        CHARGE = safeInt(llGetSubString(chStr, 0, idx-1));
+        CHARGEMAX = safeInt(llGetSubString(chStr, idx+1, -1));
+    }
+    
+    // Parse XP
+    idx = llSubStringIndex(xpStr, "/");
+    if(idx > 0){
+        XP = safeInt(llGetSubString(xpStr, 0, idx-1));
+        XPMAX = safeInt(llGetSubString(xpStr, idx+1, -1));
+    }
+    
+    // Parse level and invuln
+    if(lvStr != ""){
+        LV = safeInt(lvStr);
+        inputLevel = lvStr; // Update display level
+    }
+    if(invStr != "") INVULN = safeInt(invStr);
+    
+    updateAllDisplays();
+    return TRUE;
+}
+
+integer handleCooldownUpdate(string payload){
+    // Parse: CD|p:<n>|sweet:<n>|combo:<n>
+    list parts = llParseString2List(payload, ["|", ":"], []);
+    
+    string pStr = kvGet(parts, "p");
+    string sweetStr = kvGet(parts, "sweet");
+    string comboStr = kvGet(parts, "combo");
+    
+    if(pStr != "") CD_PCT = safeInt(pStr);
+    if(sweetStr != "") SWEET = safeInt(sweetStr);
+    if(comboStr != "") COMBO = safeInt(comboStr);
+    
+    updateCooldownIndicator();
+    updateInvulnIndicator(); // Update flash if invuln
+    return TRUE;
+}
+
+// ===== Timer for animations =====
+float lastUpdate = 0.0;
+integer timerActive = FALSE;
+
+integer startTimer(){
+    if(!timerActive){
+        llSetTimerEvent(0.1); // 10Hz for smooth pulse effects
+        timerActive = TRUE;
+    }
+    return TRUE;
+}
+
+integer stopTimer(){
+    if(timerActive){
+        llSetTimerEvent(0.0);
+        timerActive = FALSE;
+    }
+    return TRUE;
+}
+
+// ===== State =====
+default
+{
+    state_entry()
+    {
+        setupListens();
+        
+        // Initialize display
+        llSetLinkPrimitiveParamsFast(2, [PRIM_TEXT, inputDisplayName + "\n" + inputName + inputGender + " Lᵥ." + inputLevel + "\n" + inputType + "\n" + "◥▃▃▃▃▃▃▃▃▃▃▃▃  ◓", <1,1,1>, 1]);
+        llSetLinkPrimitiveParamsFast(1, [PRIM_TEXT, "\n                                      ●", <1,0,0>, 1]);
+        llSetLinkPrimitiveParamsFast(3, [PRIM_TEXT, "\n                                      ○", <0,0,0>, 1]);
+        llSetLinkPrimitiveParamsFast(4, [PRIM_TEXT, "\n    " + green_line, <0,1,0>, 1]);
+        llSetLinkPrimitiveParamsFast(5, [PRIM_TEXT, "\n    ᴴᴾ:                               ∙", <0.4,0.4,0.4>, 1]);
+        
+        // Send initial meta to combat system
+        sendMetaToCombat();
+        
+        startTimer();
+    }
+    
+    on_rez(integer start_param)
+    {
+        setupListens();
+        sendMetaToCombat();
+    }
+    
+    changed(integer change)
+    {
+        if(change & CHANGED_OWNER){
+            setupListens();
+            sendMetaToCombat();
+        }
+    }
+    
+    listen(integer channel, string name, key id, string message)
+    {
+        if(llGetOwnerKey(id) != owner) return;
+        
+        if(channel == 99){
+            handleSetupDialog(message);
+        }
+    }
+    
+    link_message(integer sender, integer opcode, string payload, key k)
+    {
+        if(opcode == OP_STATS_TITLER){
+            handleStatsUpdate(payload);
+            return;
+        }
+        
+        if(opcode == OP_COOLDOWN){
+            handleCooldownUpdate(payload);
+            return;
+        }
+    }
+    
+    timer()
+    {
+        // Update animated elements (invuln flash, sweet spot pulse)
+        if(INVULN || SWEET){
+            updateInvulnIndicator();
+            updateCooldownIndicator();
+        }
+        else {
+            // Can reduce timer frequency when nothing is animating
+            if(llGetTime() - lastUpdate > 1.0){
+                stopTimer();
+            }
+        }
+        
+        lastUpdate = llGetTime();
+    }
+}
