@@ -215,7 +215,7 @@ integer handleIncomingAttack(string wire)
 {
     // expected: atk|owner:<uuid>|mode:<melee|ranged>|src:<key>|type:<Type>
     if(llSubStringIndex(wire, "atk|") != 0) return FALSE;
-    list parts = llParseString2List(wire,["|",":"],[]);
+    list parts = llParseString2List(wire,["|",:"],[]);
     string wOwner=""; string wMode=""; string wSrc=""; string wType="";
     parseKV(parts, "owner", &wOwner);
     parseKV(parts, "mode", &wMode);
@@ -329,7 +329,7 @@ default
     link_message(integer sender, integer opcode, string payload, key k)
     {
         if(opcode==OP_ITEM_HEAL){
-            list p = llParseString2List(payload,["|",":"],[]);
+            list p = llParseString2List(payload,["|",":"],[]); 
             integer i; integer n=llGetListLength(p); integer amt=0; string code=""; string iname="";
             for(i=0;i<n-1;i+=2){ string a=safeListString(p,i); string b=safeListString(p,i+1); if(a=="code") code=b; else if(a=="amt") amt=safeInt(b); else if(a=="name") iname=b; }
             applyHeal(amt, "item:"+code); return;
