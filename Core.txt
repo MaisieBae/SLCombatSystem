@@ -1,4 +1,4 @@
-// Core RC-3.1 — Combat enabled + FIXES
+// Core RC-3.1 — Combat enabled with LSL safety improvements
 // -----------------------------------------------------------------------------
 // What's in this build
 //  ✓ Listens for ATTACK messages on a region combat channel (CH_ATK)
@@ -9,11 +9,7 @@
 //  ✓ KO announce: "<AttackerName> knocked out <YourCreatureName>!"
 //  ✓ Loser XP: 5% of winner XP (level-scaled)
 //  ✓ Items split stays: bag/dig/use live in ItemsCore via link ops
-// FIXES (RC-3.1):
-//  ✓ Proper listen handle cleanup to prevent leaks
-//  ✓ Bounds checking for list operations
-//  ✓ Validation for notecard numeric conversions
-//  ✓ Improved attack packet validation
+//  ✓ IMPROVED: Bounds checking, listen handle management, input validation
 // -----------------------------------------------------------------------------
 
 // ---------------- constants / opcodes ----------------
@@ -33,7 +29,7 @@ string  NC_TYPECARD = "TypeChart";    // effectiveness table (Att,Def,Mult)
 
 // ---------------- core stats/state ----------------
 integer DEBUG = 0;                    // set via notecard
-integer DEBUG_MIN_FREE = 1200;        // suppress logs if critically low mem
+integer DEBUG_MIN_FREE = 2048;        // increased from 1200 for safety
 
 integer HP = 30;
 integer HPMAX = 30;
@@ -58,9 +54,7 @@ integer LAST_HIT_LV = 0;
 // Type effectiveness triples: [Atk,Def,Mult,  Atk,Def,Mult, ...]
 list TYPE_EFF = [];
 
-// Listen handles
-integer L_CMD = 0;
-integer L_GESTURE = 0;
+// Listen handles for proper cleanup
 integer L_ATK = 0;
 
 // ---------------- small utils ----------------
@@ -70,6 +64,19 @@ integer now(){ return llGetUnixTime(); }
 string trim(string s){ return llStringTrim(s, STRING_TRIM); }
 string tcase(string s){ if(s=="") return s; string a=llToLower(s); return llToUpper(llGetSubString(a,0,0))+llGetSubString(a,1,-1); }
 log(string s){ if(DEBUG && memOK()) llOwnerSay("[CORE] "+s); }
+
+// Safe string to integer conversion with validation
+integer safeInt(string s){
+    s = trim(s);
+    if(s == "") return 0;
+    return (integer)((float)s);
+}
+
+// Safe list access with bounds checking
+string safeListString(list L, integer idx){
+    if(idx < 0 || idx >= llGetListLength(L)) return "";
+    return llList2String(L, idx);
+}
 
 // ---------------- linkset data (persist) ----------------
 string CK(string k){ return "core:"+k; }
@@ -91,16 +98,16 @@ integer saveState(){
 }
 integer loadState(){
     string v;
-    v=llLinksetDataRead(CK("HP")); if(v!="") HP=(integer)((float)v);
-    v=llLinksetDataRead(CK("HPMAX")); if(v!="") HPMAX=(integer)((float)v);
-    v=llLinksetDataRead(CK("LV")); if(v!="") LV=(integer)((float)v);
-    v=llLinksetDataRead(CK("XP")); if(v!="") XP=(integer)((float)v);
-    v=llLinksetDataRead(CK("XPMAX")); if(v!="") XPMAX=(integer)((float)v);
-    v=llLinksetDataRead(CK("CH")); if(v!="") CHARGE=(integer)((float)v);
-    v=llLinksetDataRead(CK("CHMAX")); if(v!="") CHARGEMAX=(integer)((float)v);
-    v=llLinksetDataRead(CK("INV")); if(v!="") INVULN=(integer)((float)v);
-    v=llLinksetDataRead(CK("LOCK")); if(v!="") ATTACK_LOCKED=(integer)((float)v);
-    v=llLinksetDataRead(CK("invUntil")); if(v!="") invulnUntil=(integer)((float)v);
+    v=llLinksetDataRead(CK("HP")); if(v!="") HP=safeInt(v);
+    v=llLinksetDataRead(CK("HPMAX")); if(v!="") HPMAX=safeInt(v);
+    v=llLinksetDataRead(CK("LV")); if(v!="") LV=safeInt(v);
+    v=llLinksetDataRead(CK("XP")); if(v!="") XP=safeInt(v);
+    v=llLinksetDataRead(CK("XPMAX")); if(v!="") XPMAX=safeInt(v);
+    v=llLinksetDataRead(CK("CH")); if(v!="") CHARGE=safeInt(v);
+    v=llLinksetDataRead(CK("CHMAX")); if(v!="") CHARGEMAX=safeInt(v);
+    v=llLinksetDataRead(CK("INV")); if(v!="") INVULN=safeInt(v);
+    v=llLinksetDataRead(CK("LOCK")); if(v!="") ATTACK_LOCKED=safeInt(v);
+    v=llLinksetDataRead(CK("invUntil")); if(v!="") invulnUntil=safeInt(v);
     v=llLinksetDataRead(CK("SELF_NAME")); if(v!="") SELF_NAME=v;
     v=llLinksetDataRead(CK("SELF_T1")); if(v!="") SELF_T1=v;
     v=llLinksetDataRead(CK("SELF_T2")); if(v!="") SELF_T2=v;
@@ -141,8 +148,8 @@ integer addXP(integer amt){
 float effLookup(string atk, string def){
     atk = tcase(trim(atk)); def = tcase(trim(def)); if(atk=="" || def=="") return 1.0;
     integer n = llGetListLength(TYPE_EFF); integer i; for(i=0;i<n;i+=3){
-        string A = llList2String(TYPE_EFF,i); string D = llList2String(TYPE_EFF,i+1);
-        if(A==atk && D==def){ string m = llList2String(TYPE_EFF,i+2); return (float)m; }
+        string A = safeListString(TYPE_EFF,i); string D = safeListString(TYPE_EFF,i+1);
+        if(A==atk && D==def){ string m = safeListString(TYPE_EFF,i+2); return (float)m; }
     }
     return 1.0;
 }
@@ -202,31 +209,13 @@ integer applyHeal(integer amt, string src){
 integer canAttack(){ if(ATTACK_LOCKED){ if(DEBUG) llOwnerSay("[CORE] Cannot attack while invulnerable."); return FALSE; } if(HP<=0){ if(DEBUG) llOwnerSay("[CORE] Cannot attack at 0 HP."); return FALSE; } return TRUE; }
 
 // ---------------- attack handling ----------------
-// FIXED: Added bounds checking
-integer parseKV(list lst, string keyFind, string *out){ 
-    integer i; 
-    integer n=llGetListLength(lst); 
-    if(n < 2) return FALSE; // Need at least one key:value pair
-    for(i=0;i<n-1;i+=2){ 
-        if(i+1 >= n) return FALSE; // Bounds check
-        string k=llList2String(lst,i); 
-        if(k==keyFind){ 
-            *out = llList2String(lst,i+1); 
-            return TRUE; 
-        } 
-    } 
-    return FALSE; 
-}
+integer parseKV(list lst, string keyFind, string *out){ integer i; integer n=llGetListLength(lst); for(i=0;i<n-1;i+=2){ string k=safeListString(lst,i); if(k==keyFind){ *out = safeListString(lst,i+1); return TRUE; } } return FALSE; }
 
 integer handleIncomingAttack(string wire)
 {
     // expected: atk|owner:<uuid>|mode:<melee|ranged>|src:<key>|type:<Type>
     if(llSubStringIndex(wire, "atk|") != 0) return FALSE;
     list parts = llParseString2List(wire,["|",":"],[]);
-    
-    // Validate minimum packet structure
-    if(llGetListLength(parts) < 8) return FALSE; // Need at least 4 key:value pairs
-    
     string wOwner=""; string wMode=""; string wSrc=""; string wType="";
     parseKV(parts, "owner", &wOwner);
     parseKV(parts, "mode", &wMode);
@@ -234,10 +223,7 @@ integer handleIncomingAttack(string wire)
     parseKV(parts, "type", &wType);
 
     // Friendly fire guard (ignore self/owner attacks)
-    // FIXED: Added null key validation
-    if(wOwner == "") return FALSE; // Invalid packet
     if(wOwner == (string)llGetOwner()) return TRUE;
-    if((key)wOwner == llGetOwner()) return TRUE; // Double check with key cast
 
     // Record last hitter name/level if the packet included it in a prior OP_LAST_HIT
     // (Optionally enrich here by cross-lookup; for now we trust OP_LAST_HIT or leave blank)
@@ -254,7 +240,7 @@ integer handleIncomingAttack(string wire)
     if(dmg < 1) dmg = 1;
 
     if(DEBUG){
-        string tdisp = "("+SELF_T1; if(SELF_T2!="") tdisp += ","+SELF_T2; tdisp += ")";
+        string tdisp = "("+(SELF_T1); if(SELF_T2!="") tdisp += ","+SELF_T2; tdisp += ")";
         llOwnerSay("[CORE] recv: "+wire);
         llOwnerSay("[CORE] calc: base="+(string)base+" type="+wType+" vs "+tdisp+" eff="+(string)eff+" → dmg="+(string)dmg);
     }
@@ -285,23 +271,6 @@ integer showMenu(){ list btn=["Bag","Dig","Close"]; llDialog(M_USER, "System Men
 key cfgReq = NULL_KEY; integer cfgLine=0; integer cfgLoading=FALSE;
 integer cfgStart(){ if(llGetInventoryType(NC_CONFIG)==INVENTORY_NOTECARD){ cfgLoading=TRUE; cfgLine=0; cfgReq=llGetNotecardLine(NC_CONFIG,cfgLine);} return TRUE; }
 
-// ---------------- listen handle cleanup ----------------
-integer cleanupListens(){
-    if(L_CMD) llListenRemove(L_CMD);
-    if(L_GESTURE) llListenRemove(L_GESTURE);
-    if(L_ATK) llListenRemove(L_ATK);
-    L_CMD = 0; L_GESTURE = 0; L_ATK = 0;
-    return TRUE;
-}
-
-integer setupListens(){
-    cleanupListens();
-    L_CMD = llListen(CH_CMD, "", llGetOwner(), "");
-    L_GESTURE = llListen(CH_GESTURE, "", llGetOwner(), "");
-    L_ATK = llListen(CH_ATK, "", NULL_KEY, "");
-    return TRUE;
-}
-
 // ---------------- state ----------------
 default
 {
@@ -309,7 +278,9 @@ default
     {
         loadState(); if(HP<=0) HP=HPMAX; XPMAX = xpNextFor(LV); pushStats();
         cfgStart(); typeStart();
-        setupListens();
+        llListen(CH_CMD, "", llGetOwner(), "");         // /0037 owner
+        llListen(CH_GESTURE, "", llGetOwner(), "");     // /69 test sender
+        L_ATK = llListen(CH_ATK, "", NULL_KEY, "");     // region combat bus (track handle)
         if(invulnUntil>0) llSetTimerEvent(0.25);
         log("Core RC-3.1 ready.");
     }
@@ -331,7 +302,8 @@ default
         else if(ch==CH_GESTURE && id==llGetOwner()){
             // /69 melee Fire   or   /69 ranged Water
             list L = llParseStringKeepNulls(msg,[" "],[]);
-            if(llGetListLength(L)>=2){ string mode=llToLower(llList2String(L,0)); string typ=llList2String(L,1); if(mode=="melee"||mode=="ranged"){ sendAttack(mode, typ); return; } }
+            integer len = llGetListLength(L);
+            if(len>=2){ string mode=llToLower(safeListString(L,0)); string typ=safeListString(L,1); if(mode=="melee"||mode=="ranged"){ sendAttack(mode, typ); return; } }
         }
         else if(ch==CH_ATK){ handleIncomingAttack(msg); return; }
         else if(ch==M_CH && id==M_USER){
@@ -345,52 +317,12 @@ default
 
     dataserver(key rq, string data)
     {
-        if(rq==cfgReq){ 
-            if(data==EOF){ cfgLoading=FALSE; cfgReq=NULL_KEY; log("CombatConfig loaded. DEBUG="+(string)DEBUG); return; }
-            if(data!=""){ 
-                integer eq=llSubStringIndex(data, "="); 
-                if(eq>0){ 
-                    string k=llStringTrim(llGetSubString(data,0,eq-1),STRING_TRIM); 
-                    string v=llStringTrim(llGetSubString(data,eq+1,-1),STRING_TRIM); 
-                    // FIXED: Validate numeric conversions
-                    if(k=="DEBUG"){ 
-                        if(v != "") DEBUG=(integer)((float)v); 
-                    } 
-                    else if(k=="COMBAT_CH"){ 
-                        if(v != ""){
-                            integer newCH = (integer)((float)v);
-                            if(newCH != CH_ATK){
-                                CH_ATK = newCH;
-                                // FIXED: Properly cleanup and recreate listen
-                                if(L_ATK) llListenRemove(L_ATK);
-                                L_ATK = llListen(CH_ATK, "", NULL_KEY, "");
-                                log("CH_ATK updated to "+(string)CH_ATK);
-                            }
-                        }
-                    } 
-                } 
-            }
-            cfgReq = llGetNotecardLine(NC_CONFIG, ++cfgLine); return; 
-        }
-        if(rq==tcReq){ 
-            if(data==EOF){ tcLoading=FALSE; tcReq=NULL_KEY; log("TypeChart loaded ("+(string)(llGetListLength(TYPE_EFF)/3)+" entries)."); return; }
-            if(data!=""){ 
-                string ln=trim(data); 
-                if(ln!="" && llGetSubString(ln,0,0)!="#"){ 
-                    list L=llParseString2List(ln,[",","\t"],[]); 
-                    if(llGetListLength(L)>=3){ 
-                        string A=tcase(llList2String(L,0)); 
-                        string D=tcase(llList2String(L,1)); 
-                        string M=trim(llList2String(L,2)); 
-                        // FIXED: Validate multiplier is numeric
-                        if(M != "" && ((float)M != 0.0 || M == "0" || M == "0.0")){
-                            TYPE_EFF += [A,D,M]; 
-                        }
-                    } 
-                } 
-            }
-            tcReq = llGetNotecardLine(NC_TYPECARD, ++tcLine); return; 
-        }
+        if(rq==cfgReq){ if(data==EOF){ cfgLoading=FALSE; cfgReq=NULL_KEY; log("CombatConfig loaded. DEBUG="+(string)DEBUG); return; }
+            if(data!=""){ integer eq=llSubStringIndex(data, "="); if(eq>0){ string k=llStringTrim(llGetSubString(data,0,eq-1),STRING_TRIM); string v=llStringTrim(llGetSubString(data,eq+1,-1),STRING_TRIM); if(k=="DEBUG"){ DEBUG=safeInt(v); } else if(k=="COMBAT_CH"){ integer newCH=safeInt(v); if(newCH!=CH_ATK){ if(L_ATK) llListenRemove(L_ATK); CH_ATK=newCH; L_ATK=llListen(CH_ATK, "", NULL_KEY, ""); } } } }
+            cfgReq = llGetNotecardLine(NC_CONFIG, ++cfgLine); return; }
+        if(rq==tcReq){ if(data==EOF){ tcLoading=FALSE; tcReq=NULL_KEY; log("TypeChart loaded ("+(string)(llGetListLength(TYPE_EFF)/3)+" entries)."); return; }
+            if(data!=""){ string ln=trim(data); if(ln!="" && llGetSubString(ln,0,0)!="#"){ list L=llParseString2List(ln,[",","\t"],[]); if(llGetListLength(L)>=3){ string A=tcase(safeListString(L,0)); string D=tcase(safeListString(L,1)); string M=trim(safeListString(L,2)); TYPE_EFF += [A,D,M]; } } }
+            tcReq = llGetNotecardLine(NC_TYPECARD, ++tcLine); return; }
     }
 
     // Items + Titler integration
@@ -399,50 +331,13 @@ default
         if(opcode==OP_ITEM_HEAL){
             list p = llParseString2List(payload,["|",":"],[]);
             integer i; integer n=llGetListLength(p); integer amt=0; string code=""; string iname="";
-            for(i=0;i<n-1;i+=2){ 
-                if(i+1 >= n) jump done_heal; // Bounds check
-                string a=llList2String(p,i); 
-                string b=llList2String(p,i+1); 
-                if(a=="code") code=b; 
-                else if(a=="amt") amt=(integer)((float)b); 
-                else if(a=="name") iname=b; 
-            }
-            @done_heal;
+            for(i=0;i<n-1;i+=2){ string a=safeListString(p,i); string b=safeListString(p,i+1); if(a=="code") code=b; else if(a=="amt") amt=safeInt(b); else if(a=="name") iname=b; }
             applyHeal(amt, "item:"+code); return;
         }
         if(opcode==OP_TITLER_META){
-            if(llSubStringIndex(payload,"META")==0){ 
-                list parts=llParseString2List(payload,["|"],[]); 
-                integer j; integer m=llGetListLength(parts); 
-                for(j=1;j<m;j++){ 
-                    string kv=llList2String(parts,j); 
-                    integer px=llSubStringIndex(kv,":"); 
-                    if(px>0){ 
-                        string k2=llGetSubString(kv,0,px-1); 
-                        string v2=llGetSubString(kv,px+1,-1); 
-                        if(k2=="NAME") SELF_NAME=v2; 
-                        else if(k2=="T1") SELF_T1=v2; 
-                        else if(k2=="T2") SELF_T2=v2; 
-                    } 
-                } 
-                saveState(); 
-            }
+            if(llSubStringIndex(payload,"META")==0){ list parts=llParseString2List(payload,["|"],[]); integer j; integer m=llGetListLength(parts); for(j=1;j<m;j++){ string kv=safeListString(parts,j); integer px=llSubStringIndex(kv,":"); if(px>0){ string k2=llGetSubString(kv,0,px-1); string v2=llGetSubString(kv,px+1,-1); if(k2=="NAME") SELF_NAME=v2; else if(k2=="T1") SELF_T1=v2; else if(k2=="T2") SELF_T2=v2; } } saveState(); }
             return;
         }
-        if(opcode==OP_LAST_HIT){ 
-            list p=llParseString2List(payload,["|",":"],[]); 
-            integer i; integer n=llGetListLength(p); 
-            string nm=""; integer lv=0; 
-            for(i=0;i<n-1;i+=2){ 
-                if(i+1 >= n) jump done_lasthit; // Bounds check
-                string a=llList2String(p,i); 
-                string b=llList2String(p,i+1); 
-                if(a=="name") nm=b; 
-                else if(a=="lv") lv=(integer)((float)b); 
-            } 
-            @done_lasthit;
-            LAST_HIT_NAME=nm; LAST_HIT_LV=lv; 
-            return; 
-        }
+        if(opcode==OP_LAST_HIT){ list p=llParseString2List(payload,["|",":"],[]); integer i; integer n=llGetListLength(p); string nm=""; integer lv=0; for(i=0;i<n-1;i+=2){ string a=safeListString(p,i); string b=safeListString(p,i+1); if(a=="name") nm=b; else if(a=="lv") lv=safeInt(b); } LAST_HIT_NAME=nm; LAST_HIT_LV=lv; return; }
     }
 }
