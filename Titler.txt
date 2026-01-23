@@ -1,66 +1,109 @@
-// Titler RC-1.0 — Multi-prim display integrated with Combat System
+// Titler RC-2.0 — Single-prim floating text display integrated with Combat System
 // -------------------------------------------------------------------------------------------------
 // Purpose:
-//   Displays creature stats using the 5-prim text layer system while integrating with
-//   CombatCore via link messages (OP_STATS_TITLER, OP_TITLER_META, OP_COOLDOWN)
+//   Displays creature stats as formatted floating text, integrating with CombatCore via
+//   link messages. Supports configuration for colors, format, and visibility.
 //
-// Display Layout (5 linked prims):
-//   Prim 2 (white): Name, Breed/Gender/Level, Type, decorative line
-//   Prim 1 (red):   Invulnerability indicator (●)
-//   Prim 3 (black): Secondary indicator (○)
-//   Prim 4 (green): HP bar (▀ blocks)
-//   Prim 5 (gray):  ᴴᴾ: label and charge/XP display
+// Opcodes Handled:
+//   OP_STATS_TITLER (7001) ← Core/CombatCore: HP/CH/LV/XP/INV updates
+//   OP_TITLER_META (7002)  → Core/CombatCore: Send NAME/T1/T2 metadata
+//   OP_COOLDOWN (7010)     ← CombatCore: Cooldown percentage/sweet/combo
+//   OP_FACTORY_REQ (7900)  ← System-wide factory reset
 //
-// Setup:
-//   /99 setup     - Start guided setup (name, gender, level, breed, type)
-//   /99 name X    - Set display name
-//   /99 breed X   - Set breed name
-//   /99 gender X  - Set gender (female/male/herm/nonbinary)
-//   /99 level X   - Set level
-//   /99 type X    - Set type(s)
+// Setup Commands:
+//   /37 titler config  - Open configuration menu
+//   /37 titler hide    - Hide display
+//   /37 titler show    - Show display
+//   /37 titler name X  - Set display name
+//   /37 titler breed X - Set breed name
+//   /37 titler type X  - Set type (e.g., "Fire" or "Fire/Flying")
+//
+// Configuration Notecard (optional): TitlerConfig
+//   FORMAT=<format_id>      // 0=Full, 1=Compact, 2=Minimal
+//   COLOR_NAME=<r,g,b>      // RGB 0.0-1.0
+//   COLOR_STATS=<r,g,b>
+//   COLOR_HP_HIGH=<r,g,b>   // HP > 66%
+//   COLOR_HP_MID=<r,g,b>    // HP 33-66%
+//   COLOR_HP_LOW=<r,g,b>    // HP < 33%
+//   SHOW_XP=<0|1>
+//   SHOW_CHARGE=<0|1>
+//   SHOW_TYPE=<0|1>
+//   ALPHA=<0.0-1.0>
 //
 // LSL-safe: no ternary, no break
+// Memory-efficient: minimal string operations, reusable buffers
 // -------------------------------------------------------------------------------------------------
 
-// ===== Opcodes from Combat System =====
-integer OP_STATS_TITLER = 7001; // ← Core/CombatCore: HP:<n>/<n>|CH:<n>/<n>|LV:<n>|XP:<n>/<n>|INV:<n>
-integer OP_TITLER_META  = 7002; // → Core/CombatCore: META|NAME:<s>|T1:<s>|T2:<s>
-integer OP_COOLDOWN     = 7010; // ← CombatCore: CD|p:<n>|sweet:<n>|combo:<n>
+// ===== Opcodes =====
+integer OP_STATS_TITLER = 7001;
+integer OP_TITLER_META  = 7002;
+integer OP_COOLDOWN     = 7010;
+integer OP_FACTORY_REQ  = 7900;
+
+// ===== Config Keys (LinksetData) =====
+string CK(string k){ return "titler:"+k; }
 
 // ===== Display State =====
-// User-configured (persistent)
-string inputName = "";           // Breed name (e.g., "Pikachu")
-string inputGender = "";         // Gender symbol
-string inputLevel = "1";         // Display level
-string inputDisplayName = "";   // Creature's nickname
-string inputType = "";           // Type string (e.g., "Electric")
+// User-configured
+string displayName = "";
+string breedName = "";
+string typeStr = "";
+string genderSymbol = "";
 
-// Combat stats (from link messages)
+// Combat stats
 integer HP = 30; integer HPMAX = 30;
 integer CHARGE = 0; integer CHARGEMAX = 4;
 integer LV = 1;
 integer XP = 0; integer XPMAX = 100;
 integer INVULN = 0;
-integer CD_PCT = 0;       // Cooldown percentage (0-100)
-integer SWEET = 0;        // Sweet spot active
-integer COMBO = 0;        // Combo count
+integer CD_PCT = 0;
+integer SWEET = 0;
+integer COMBO = 0;
 
-// Display formatting
-string healthbit = "▀";
-string green_line = "▀▀▀▀▀▀▀▀▀▀";
+// Config
+integer FORMAT = 0;        // 0=Full, 1=Compact, 2=Minimal
+vector COLOR_NAME = <1.0, 1.0, 1.0>;
+vector COLOR_STATS = <0.8, 0.8, 0.8>;
+vector COLOR_HP_HIGH = <0.0, 1.0, 0.0>;
+vector COLOR_HP_MID = <1.0, 1.0, 0.0>;
+vector COLOR_HP_LOW = <1.0, 0.0, 0.0>;
+integer SHOW_XP = 1;
+integer SHOW_CHARGE = 1;
+integer SHOW_TYPE = 1;
+float ALPHA = 1.0;
+integer VISIBLE = 1;
 
-// Listen state
-integer listenHandle = 0;
-integer listenSetup = 0;
-integer dialogStage = 0;
-key owner = NULL_KEY;
+// Menu state
+integer MENU_LIS = 0;
+integer MENU_CH = 0;
+key MENU_USER = NULL_KEY;
+
+// Notecard reading
+string NC_CONFIG = "TitlerConfig";
+key rqConfig = NULL_KEY;
+integer lnConfig = 0;
+integer rdConfig = FALSE;
+
+// Listen handles
+integer L_CMD = 0;
+integer CH_CMD = 37;
+
+// Timer for animations
+float lastFlash = 0.0;
+integer needsTimer = FALSE;
+
+// ===== Debug =====
+integer DEBUG = 0;
+integer DEBUG_MIN_FREE = 1024;
+integer memOK(){ return llGetFreeMemory() > DEBUG_MIN_FREE; }
+integer log(string s){ if(DEBUG && memOK()) llOwnerSay("[Titler] "+s); return TRUE; }
 
 // ===== Utils =====
 string trim(string s){ return llStringTrim(s, STRING_TRIM); }
 string tcase(string s){ if(s=="") return s; string a=llToLower(s); return llToUpper(llGetSubString(a,0,0))+llGetSubString(a,1,-1); }
 integer safeInt(string s){ s=trim(s); if(s=="") return 0; return (integer)((float)s); }
+float safeFloat(string s){ s=trim(s); if(s=="") return 0.0; return (float)s; }
 
-// KV parser with bounds checking
 string kvGet(list parts, string tag){ 
     integer i; integer n=llGetListLength(parts); 
     if(n < 2) return "";
@@ -71,274 +114,287 @@ string kvGet(list parts, string tag){
     return ""; 
 }
 
-// ===== Display Updates =====
-integer updateMainText(){
-    string white;
-    // Build display: DisplayName\nBreed Gender Lv.Level\nType\nDecorative
-    white = inputDisplayName + "\n" +
-            inputName + inputGender + " Lᵥ." + inputLevel + "\n" +
-            inputType + "\n" +
-            "◥▃▃▃▃▃▃▃▃▃▃▃▃  ◓";
-    
-    llSetLinkPrimitiveParamsFast(2, [PRIM_TEXT, white, <1,1,1>, 1]);
+vector parseColor(string s){
+    list parts = llParseString2List(s, [","], []);
+    if(llGetListLength(parts) < 3) return <1,1,1>;
+    return <safeFloat(llList2String(parts,0)), 
+            safeFloat(llList2String(parts,1)), 
+            safeFloat(llList2String(parts,2))>;
+}
+
+// ===== LinksetData Persistence =====
+integer saveConfig(){
+    llLinksetDataWrite(CK("displayName"), displayName);
+    llLinksetDataWrite(CK("breedName"), breedName);
+    llLinksetDataWrite(CK("typeStr"), typeStr);
+    llLinksetDataWrite(CK("genderSymbol"), genderSymbol);
+    llLinksetDataWrite(CK("FORMAT"), (string)FORMAT);
+    llLinksetDataWrite(CK("SHOW_XP"), (string)SHOW_XP);
+    llLinksetDataWrite(CK("SHOW_CHARGE"), (string)SHOW_CHARGE);
+    llLinksetDataWrite(CK("SHOW_TYPE"), (string)SHOW_TYPE);
+    llLinksetDataWrite(CK("ALPHA"), (string)ALPHA);
+    llLinksetDataWrite(CK("VISIBLE"), (string)VISIBLE);
+    // Colors
+    llLinksetDataWrite(CK("COLOR_NAME"), (string)COLOR_NAME);
+    llLinksetDataWrite(CK("COLOR_STATS"), (string)COLOR_STATS);
+    llLinksetDataWrite(CK("COLOR_HP_HIGH"), (string)COLOR_HP_HIGH);
+    llLinksetDataWrite(CK("COLOR_HP_MID"), (string)COLOR_HP_MID);
+    llLinksetDataWrite(CK("COLOR_HP_LOW"), (string)COLOR_HP_LOW);
     return TRUE;
 }
 
-integer updateHPBar(){
-    // Calculate how many blocks to show (scale HP to 10 blocks)
-    integer blocks = 0;
-    if(HPMAX > 0){
-        blocks = (HP * 10) / HPMAX;
-        if(blocks < 0) blocks = 0;
-        if(blocks > 10) blocks = 10;
-    }
-    
-    green_line = "";
-    integer i;
-    for(i = 0; i < blocks; ++i){
-        green_line += healthbit;
-    }
-    // Fill remaining with spaces
-    for(i = blocks; i < 10; ++i){
-        green_line += "  ";
-    }
-    
-    llSetLinkPrimitiveParamsFast(4, [PRIM_TEXT, "\n    " + green_line, <0,1,0>, 1]);
+integer loadConfig(){
+    string v;
+    v=llLinksetDataRead(CK("displayName")); if(v!="") displayName=v;
+    v=llLinksetDataRead(CK("breedName")); if(v!="") breedName=v;
+    v=llLinksetDataRead(CK("typeStr")); if(v!="") typeStr=v;
+    v=llLinksetDataRead(CK("genderSymbol")); if(v!="") genderSymbol=v;
+    v=llLinksetDataRead(CK("FORMAT")); if(v!="") FORMAT=safeInt(v);
+    v=llLinksetDataRead(CK("SHOW_XP")); if(v!="") SHOW_XP=safeInt(v);
+    v=llLinksetDataRead(CK("SHOW_CHARGE")); if(v!="") SHOW_CHARGE=safeInt(v);
+    v=llLinksetDataRead(CK("SHOW_TYPE")); if(v!="") SHOW_TYPE=safeInt(v);
+    v=llLinksetDataRead(CK("ALPHA")); if(v!="") ALPHA=safeFloat(v);
+    v=llLinksetDataRead(CK("VISIBLE")); if(v!="") VISIBLE=safeInt(v);
+    // Colors
+    v=llLinksetDataRead(CK("COLOR_NAME")); if(v!="") COLOR_NAME=(vector)v;
+    v=llLinksetDataRead(CK("COLOR_STATS")); if(v!="") COLOR_STATS=(vector)v;
+    v=llLinksetDataRead(CK("COLOR_HP_HIGH")); if(v!="") COLOR_HP_HIGH=(vector)v;
+    v=llLinksetDataRead(CK("COLOR_HP_MID")); if(v!="") COLOR_HP_MID=(vector)v;
+    v=llLinksetDataRead(CK("COLOR_HP_LOW")); if(v!="") COLOR_HP_LOW=(vector)v;
     return TRUE;
 }
 
-integer updateStatsBar(){
-    // Bottom gray line shows HP:actual/max and charge/XP info
-    string stats = "\n    ᴴᴾ:" + (string)HP + "/" + (string)HPMAX + 
-                   "  ᶜʰ:" + (string)CHARGE + "/" + (string)CHARGEMAX +
-                   "  ˣᵖ:" + (string)XP + "/" + (string)XPMAX + "                               ∙";
-    
-    llSetLinkPrimitiveParamsFast(5, [PRIM_TEXT, stats, <0.4,0.4,0.4>, 1]);
-    return TRUE;
-}
-
-integer updateInvulnIndicator(){
-    // Red dot (●) flashes when invulnerable
-    vector color = <1,0,0>;
-    float alpha = 1.0;
-    
-    if(INVULN){
-        // Flash effect
-        alpha = 0.5 + 0.5 * llSin(llGetTime() * 10.0); // Pulse between 0.5 and 1.0
-        color = <1,0.3,0>; // Orange when invuln
-    }
-    
-    llSetLinkPrimitiveParamsFast(1, [PRIM_TEXT, "\n                                      ●", color, alpha]);
-    return TRUE;
-}
-
-integer updateCooldownIndicator(){
-    // Black dot (○) shows cooldown/combo status
-    string text = "\n                                      ○";
-    vector color = <0,0,0>;
-    float alpha = 1.0;
-    
-    if(SWEET){
-        // Yellow when in sweet spot
-        color = <1,1,0>;
-        alpha = 0.8 + 0.2 * llSin(llGetTime() * 15.0); // Fast pulse
-    }
-    else if(CD_PCT < 100){
-        // Dim while on cooldown
-        alpha = (float)CD_PCT / 100.0;
-    }
-    
-    if(COMBO > 0){
-        // Show combo count
-        text = "\n                                  " + (string)COMBO + "×○";
-    }
-    
-    llSetLinkPrimitiveParamsFast(3, [PRIM_TEXT, text, color, alpha]);
-    return TRUE;
-}
-
-integer updateAllDisplays(){
-    updateMainText();
-    updateHPBar();
-    updateStatsBar();
-    updateInvulnIndicator();
-    updateCooldownIndicator();
-    return TRUE;
-}
-
-// ===== Setup Dialogs =====
-integer setupListens(){
-    if(listenHandle) llListenRemove(listenHandle);
-    if(listenSetup) llListenRemove(listenSetup);
-    
-    owner = llGetOwner();
-    listenSetup = llListen(99, "", owner, "");
-    return TRUE;
-}
-
-integer handleSetupDialog(string message){
-    string lower = llToLower(message);
-    
-    // Start setup wizard
-    if(lower == "setup"){
-        dialogStage = 1;
-        llTextBox(owner, "Enter the Creature Breed (e.g., Pikachu):", 99);
+// ===== Notecard Config =====
+integer startConfigRead(){
+    if(llGetInventoryType(NC_CONFIG)==INVENTORY_NOTECARD){
+        rdConfig=TRUE; lnConfig=0;
+        rqConfig=llGetNotecardLine(NC_CONFIG, lnConfig);
         return TRUE;
     }
-    
-    // Setup stages
-    if(dialogStage == 1){
-        inputName = message;
-        dialogStage = 2;
-        list opts = ["Female", "Male", "Herm", "Nonbinary"];
-        llDialog(owner, "Select gender:", opts, 99);
-        return TRUE;
-    }
-    
-    if(dialogStage == 2){
-        string g = llToLower(message);
-        if(g == "female") inputGender = " ♀";
-        else if(g == "male") inputGender = " ♂";
-        else if(g == "herm" || g == "hermaphrodite") inputGender = " ⚥";
-        else if(g == "nonbinary") inputGender = " ⚧";
-        else {
-            list opts = ["Female", "Male", "Herm", "Nonbinary"];
-            llDialog(owner, "Invalid. Select gender:", opts, 99);
-            return TRUE;
-        }
-        
-        dialogStage = 3;
-        llTextBox(owner, "Enter level (number will be overridden by combat system):", 99);
-        return TRUE;
-    }
-    
-    if(dialogStage == 3){
-        inputLevel = message;
-        dialogStage = 4;
-        llTextBox(owner, "Enter the creature's nickname:", 99);
-        return TRUE;
-    }
-    
-    if(dialogStage == 4){
-        inputDisplayName = message;
-        dialogStage = 5;
-        llTextBox(owner, "Enter type(s) - e.g., 'Electric' or 'Fire/Flying':", 99);
-        return TRUE;
-    }
-    
-    if(dialogStage == 5){
-        inputType = message;
-        dialogStage = 0;
-        updateAllDisplays();
-        sendMetaToCombat();
-        llOwnerSay("Setup complete! Stats will update from combat system.");
-        return TRUE;
-    }
-    
-    // Direct commands
-    if(llSubStringIndex(lower, "name ") == 0){
-        inputDisplayName = llGetSubString(message, 5, -1);
-        updateAllDisplays();
-        sendMetaToCombat();
-        return TRUE;
-    }
-    
-    if(llSubStringIndex(lower, "breed ") == 0){
-        inputName = llGetSubString(message, 6, -1);
-        updateAllDisplays();
-        return TRUE;
-    }
-    
-    if(llSubStringIndex(lower, "gender ") == 0){
-        string g = llToLower(llGetSubString(message, 7, -1));
-        if(g == "female") inputGender = " ♀";
-        else if(g == "male") inputGender = " ♂";
-        else if(g == "herm" || g == "hermaphrodite") inputGender = " ⚥";
-        else if(g == "nonbinary") inputGender = " ⚧";
-        updateAllDisplays();
-        return TRUE;
-    }
-    
-    if(llSubStringIndex(lower, "level ") == 0){
-        inputLevel = llGetSubString(message, 6, -1);
-        updateAllDisplays();
-        return TRUE;
-    }
-    
-    if(llSubStringIndex(lower, "type ") == 0){
-        inputType = llGetSubString(message, 5, -1);
-        updateAllDisplays();
-        sendMetaToCombat();
-        return TRUE;
-    }
-    
     return FALSE;
+}
+
+integer applyConfigLine(string line){
+    line = trim(line);
+    if(line=="" || llGetSubString(line,0,0)=="#") return FALSE;
+    
+    integer p = llSubStringIndex(line, "=");
+    if(p<=0) return FALSE;
+    
+    string k = trim(llGetSubString(line,0,p-1));
+    string v = trim(llGetSubString(line,p+1,-1));
+    
+    if(k=="FORMAT") FORMAT = safeInt(v);
+    else if(k=="COLOR_NAME") COLOR_NAME = parseColor(v);
+    else if(k=="COLOR_STATS") COLOR_STATS = parseColor(v);
+    else if(k=="COLOR_HP_HIGH") COLOR_HP_HIGH = parseColor(v);
+    else if(k=="COLOR_HP_MID") COLOR_HP_MID = parseColor(v);
+    else if(k=="COLOR_HP_LOW") COLOR_HP_LOW = parseColor(v);
+    else if(k=="SHOW_XP") SHOW_XP = safeInt(v);
+    else if(k=="SHOW_CHARGE") SHOW_CHARGE = safeInt(v);
+    else if(k=="SHOW_TYPE") SHOW_TYPE = safeInt(v);
+    else if(k=="ALPHA") ALPHA = safeFloat(v);
+    
+    return TRUE;
+}
+
+// ===== Display Building =====
+vector getHPColor(){
+    if(HPMAX <= 0) return COLOR_HP_HIGH;
+    integer pct = (HP * 100) / HPMAX;
+    if(pct > 66) return COLOR_HP_HIGH;
+    if(pct > 33) return COLOR_HP_MID;
+    return COLOR_HP_LOW;
+}
+
+string buildHPBar(){
+    // Simple bar: ▰▰▰▰▰▱▱▱▱▱
+    if(HPMAX <= 0) return "";
+    
+    integer blocks = (HP * 10) / HPMAX;
+    if(blocks < 0) blocks = 0;
+    if(blocks > 10) blocks = 10;
+    
+    string bar = "";
+    integer i;
+    for(i=0; i<blocks; ++i) bar += "▰";
+    for(i=blocks; i<10; ++i) bar += "▱";
+    
+    return bar;
+}
+
+string buildDisplay(){
+    if(!VISIBLE) return "";
+    
+    string text = "";
+    
+    // Name line
+    if(displayName != ""){
+        text += displayName;
+        if(FORMAT == 0) text += "\n"; // Full format adds newline
+        else text += " "; // Compact/Minimal use space
+    }
+    
+    // Breed/Gender/Level line
+    string breedLine = "";
+    if(breedName != "") breedLine += breedName;
+    if(genderSymbol != "") breedLine += genderSymbol;
+    breedLine += " Lv." + (string)LV;
+    
+    if(FORMAT == 0){
+        text += breedLine + "\n";
+    }
+    else if(FORMAT == 1){
+        text += breedLine + " ";
+    }
+    // FORMAT 2 (Minimal) skips breed line
+    
+    // Type line
+    if(SHOW_TYPE && typeStr != ""){
+        if(FORMAT == 0){
+            text += typeStr + "\n";
+        }
+        else if(FORMAT == 1){
+            text += "[" + typeStr + "] ";
+        }
+    }
+    
+    // HP line with bar
+    string hpLine = "HP:" + (string)HP + "/" + (string)HPMAX;
+    if(FORMAT == 0){
+        hpLine += " " + buildHPBar();
+        text += hpLine + "\n";
+    }
+    else {
+        text += hpLine + " ";
+    }
+    
+    // Charge
+    if(SHOW_CHARGE){
+        string chLine = "CH:" + (string)CHARGE + "/" + (string)CHARGEMAX;
+        if(FORMAT == 0){
+            text += chLine + "\n";
+        }
+        else {
+            text += chLine + " ";
+        }
+    }
+    
+    // XP
+    if(SHOW_XP){
+        string xpLine = "XP:" + (string)XP + "/" + (string)XPMAX;
+        if(FORMAT == 0){
+            text += xpLine + "\n";
+        }
+        else {
+            text += xpLine + " ";
+        }
+    }
+    
+    // Status indicators
+    if(FORMAT == 0){
+        string status = "";
+        if(INVULN) status += "[INVULN] ";
+        if(SWEET) status += "[SWEET] ";
+        if(COMBO > 0) status += "Combo x" + (string)COMBO;
+        if(status != "") text += status + "\n";
+    }
+    else {
+        if(INVULN) text += "[INV] ";
+        if(COMBO > 0) text += "x" + (string)COMBO;
+    }
+    
+    // Remove trailing whitespace
+    text = trim(text);
+    
+    return text;
+}
+
+integer updateDisplay(){
+    string text = buildDisplay();
+    vector color = COLOR_STATS;
+    float alpha = ALPHA;
+    
+    if(!VISIBLE){
+        llSetText("", <0,0,0>, 0.0);
+        return TRUE;
+    }
+    
+    // Flash effect when invuln
+    if(INVULN){
+        float pulse = 0.5 + 0.5 * llSin(llGetTime() * 8.0);
+        alpha = ALPHA * pulse;
+        color = <1.0, 0.5, 0.0>; // Orange flash
+    }
+    
+    llSetText(text, color, alpha);
+    return TRUE;
 }
 
 // ===== Combat System Integration =====
 integer sendMetaToCombat(){
-    // Send META info to Combat system
     // Parse type string for T1/T2
     string T1 = "";
     string T2 = "";
     
-    integer slash = llSubStringIndex(inputType, "/");
+    integer slash = llSubStringIndex(typeStr, "/");
     if(slash > 0){
-        T1 = tcase(trim(llGetSubString(inputType, 0, slash-1)));
-        T2 = tcase(trim(llGetSubString(inputType, slash+1, -1)));
+        T1 = tcase(trim(llGetSubString(typeStr, 0, slash-1)));
+        T2 = tcase(trim(llGetSubString(typeStr, slash+1, -1)));
     }
     else {
-        T1 = tcase(trim(inputType));
+        T1 = tcase(trim(typeStr));
     }
     
-    string meta = "META|NAME:" + inputDisplayName + "|T1:" + T1 + "|T2:" + T2;
+    string meta = "META|NAME:" + displayName + "|T1:" + T1 + "|T2:" + T2;
     llMessageLinked(LINK_SET, OP_TITLER_META, meta, NULL_KEY);
+    log("Sent META: " + meta);
     return TRUE;
 }
 
 integer handleStatsUpdate(string payload){
     // Parse: HP:<n>/<n>|CH:<n>/<n>|LV:<n>|XP:<n>/<n>|INV:<n>
-    list parts = llParseString2List(payload, ["|", ":", "/"], []);
+    list parts = llParseString2List(payload, ["|", ":"], []);
     
-    string hpStr = kvGet(parts, "HP");
-    string chStr = kvGet(parts, "CH");
-    string lvStr = kvGet(parts, "LV");
-    string xpStr = kvGet(parts, "XP");
-    string invStr = kvGet(parts, "INV");
+    string hpRaw = kvGet(parts, "HP");
+    string chRaw = kvGet(parts, "CH");
+    string lvRaw = kvGet(parts, "LV");
+    string xpRaw = kvGet(parts, "XP");
+    string invRaw = kvGet(parts, "INV");
     
-    // Parse HP (value/max format)
-    integer idx = llSubStringIndex(hpStr, "/");
+    // Parse HP (format: value/max)
+    integer idx = llSubStringIndex(hpRaw, "/");
     if(idx > 0){
-        HP = safeInt(llGetSubString(hpStr, 0, idx-1));
-        HPMAX = safeInt(llGetSubString(hpStr, idx+1, -1));
-    }
-    else if(hpStr != ""){
-        // Just HP value, find max separately
-        HP = safeInt(hpStr);
+        HP = safeInt(llGetSubString(hpRaw, 0, idx-1));
+        HPMAX = safeInt(llGetSubString(hpRaw, idx+1, -1));
     }
     
-    // Parse CHARGE
-    idx = llSubStringIndex(chStr, "/");
+    // Parse CH
+    idx = llSubStringIndex(chRaw, "/");
     if(idx > 0){
-        CHARGE = safeInt(llGetSubString(chStr, 0, idx-1));
-        CHARGEMAX = safeInt(llGetSubString(chStr, idx+1, -1));
+        CHARGE = safeInt(llGetSubString(chRaw, 0, idx-1));
+        CHARGEMAX = safeInt(llGetSubString(chRaw, idx+1, -1));
     }
     
     // Parse XP
-    idx = llSubStringIndex(xpStr, "/");
+    idx = llSubStringIndex(xpRaw, "/");
     if(idx > 0){
-        XP = safeInt(llGetSubString(xpStr, 0, idx-1));
-        XPMAX = safeInt(llGetSubString(xpStr, idx+1, -1));
+        XP = safeInt(llGetSubString(xpRaw, 0, idx-1));
+        XPMAX = safeInt(llGetSubString(xpRaw, idx+1, -1));
     }
     
-    // Parse level and invuln
-    if(lvStr != ""){
-        LV = safeInt(lvStr);
-        inputLevel = lvStr; // Update display level
-    }
-    if(invStr != "") INVULN = safeInt(invStr);
+    // Parse LV and INV
+    if(lvRaw != "") LV = safeInt(lvRaw);
+    if(invRaw != "") INVULN = safeInt(invRaw);
     
-    updateAllDisplays();
+    updateDisplay();
+    
+    // Start timer for animations if needed
+    if(INVULN && !needsTimer){
+        llSetTimerEvent(0.1);
+        needsTimer = TRUE;
+    }
+    
     return TRUE;
 }
 
@@ -354,28 +410,150 @@ integer handleCooldownUpdate(string payload){
     if(sweetStr != "") SWEET = safeInt(sweetStr);
     if(comboStr != "") COMBO = safeInt(comboStr);
     
-    updateCooldownIndicator();
-    updateInvulnIndicator(); // Update flash if invuln
+    updateDisplay();
     return TRUE;
 }
 
-// ===== Timer for animations =====
-float lastUpdate = 0.0;
-integer timerActive = FALSE;
-
-integer startTimer(){
-    if(!timerActive){
-        llSetTimerEvent(0.1); // 10Hz for smooth pulse effects
-        timerActive = TRUE;
-    }
+// ===== Menu System =====
+integer menuStart(key who){
+    if(MENU_LIS) llListenRemove(MENU_LIS);
+    MENU_CH = -(100000 + (integer)llFrand(900000.0));
+    MENU_LIS = llListen(MENU_CH, "", who, "");
+    MENU_USER = who;
     return TRUE;
 }
 
-integer stopTimer(){
-    if(timerActive){
-        llSetTimerEvent(0.0);
-        timerActive = FALSE;
+integer menuStop(){
+    if(MENU_LIS) llListenRemove(MENU_LIS);
+    MENU_LIS = 0;
+    MENU_CH = 0;
+    MENU_USER = NULL_KEY;
+    return TRUE;
+}
+
+integer showConfigMenu(){
+    list btns = [
+        "Format", "Colors", "Visibility",
+        "Show XP", "Show CH", "Show Type",
+        "Name", "Breed", "Type",
+        "Save", "Reset", "Close"
+    ];
+    
+    string msg = "Titler Configuration\n";
+    msg += "Format: " + (string)FORMAT + " ";
+    if(FORMAT == 0) msg += "(Full)";
+    else if(FORMAT == 1) msg += "(Compact)";
+    else msg += "(Minimal)";
+    msg += "\nXP:" + (string)SHOW_XP + " CH:" + (string)SHOW_CHARGE + " Type:" + (string)SHOW_TYPE;
+    msg += "\nVisible: " + (string)VISIBLE;
+    
+    llDialog(MENU_USER, msg, btns, MENU_CH);
+    return TRUE;
+}
+
+integer handleMenuButton(string btn){
+    if(btn == "Close"){
+        menuStop();
+        return TRUE;
     }
+    
+    if(btn == "Save"){
+        saveConfig();
+        llRegionSayTo(MENU_USER, 0, "Configuration saved.");
+        showConfigMenu();
+        return TRUE;
+    }
+    
+    if(btn == "Reset"){
+        // Reset to defaults
+        FORMAT = 0;
+        SHOW_XP = 1;
+        SHOW_CHARGE = 1;
+        SHOW_TYPE = 1;
+        ALPHA = 1.0;
+        COLOR_NAME = <1,1,1>;
+        COLOR_STATS = <0.8,0.8,0.8>;
+        COLOR_HP_HIGH = <0,1,0>;
+        COLOR_HP_MID = <1,1,0>;
+        COLOR_HP_LOW = <1,0,0>;
+        saveConfig();
+        updateDisplay();
+        llRegionSayTo(MENU_USER, 0, "Configuration reset to defaults.");
+        showConfigMenu();
+        return TRUE;
+    }
+    
+    if(btn == "Format"){
+        FORMAT = (FORMAT + 1) % 3;
+        updateDisplay();
+        showConfigMenu();
+        return TRUE;
+    }
+    
+    if(btn == "Visibility"){
+        VISIBLE = !VISIBLE;
+        updateDisplay();
+        showConfigMenu();
+        return TRUE;
+    }
+    
+    if(btn == "Show XP"){
+        SHOW_XP = !SHOW_XP;
+        updateDisplay();
+        showConfigMenu();
+        return TRUE;
+    }
+    
+    if(btn == "Show CH"){
+        SHOW_CHARGE = !SHOW_CHARGE;
+        updateDisplay();
+        showConfigMenu();
+        return TRUE;
+    }
+    
+    if(btn == "Show Type"){
+        SHOW_TYPE = !SHOW_TYPE;
+        updateDisplay();
+        showConfigMenu();
+        return TRUE;
+    }
+    
+    if(btn == "Name"){
+        llTextBox(MENU_USER, "Enter display name:", MENU_CH);
+        return TRUE;
+    }
+    
+    if(btn == "Breed"){
+        llTextBox(MENU_USER, "Enter breed name:", MENU_CH);
+        return TRUE;
+    }
+    
+    if(btn == "Type"){
+        llTextBox(MENU_USER, "Enter type(s) (e.g., 'Fire' or 'Fire/Flying'):", MENU_CH);
+        return TRUE;
+    }
+    
+    if(btn == "Colors"){
+        llRegionSayTo(MENU_USER, 0, "Color editing via notecard only. See TitlerConfig.");
+        showConfigMenu();
+        return TRUE;
+    }
+    
+    return FALSE;
+}
+
+// ===== Listen Handle Management =====
+integer setupListens(){
+    if(L_CMD) llListenRemove(L_CMD);
+    L_CMD = llListen(CH_CMD, "", llGetOwner(), "");
+    return TRUE;
+}
+
+integer cleanupListens(){
+    if(L_CMD) llListenRemove(L_CMD);
+    if(MENU_LIS) llListenRemove(MENU_LIS);
+    L_CMD = 0;
+    MENU_LIS = 0;
     return TRUE;
 }
 
@@ -384,41 +562,108 @@ default
 {
     state_entry()
     {
+        loadConfig();
         setupListens();
-        
-        // Initialize display
-        llSetLinkPrimitiveParamsFast(2, [PRIM_TEXT, inputDisplayName + "\n" + inputName + inputGender + " Lᵥ." + inputLevel + "\n" + inputType + "\n" + "◥▃▃▃▃▃▃▃▃▃▃▃▃  ◓", <1,1,1>, 1]);
-        llSetLinkPrimitiveParamsFast(1, [PRIM_TEXT, "\n                                      ●", <1,0,0>, 1]);
-        llSetLinkPrimitiveParamsFast(3, [PRIM_TEXT, "\n                                      ○", <0,0,0>, 1]);
-        llSetLinkPrimitiveParamsFast(4, [PRIM_TEXT, "\n    " + green_line, <0,1,0>, 1]);
-        llSetLinkPrimitiveParamsFast(5, [PRIM_TEXT, "\n    ᴴᴾ:                               ∙", <0.4,0.4,0.4>, 1]);
-        
-        // Send initial meta to combat system
-        sendMetaToCombat();
-        
-        startTimer();
-    }
-    
-    on_rez(integer start_param)
-    {
-        setupListens();
+        startConfigRead();
+        updateDisplay();
         sendMetaToCombat();
     }
     
-    changed(integer change)
+    on_rez(integer p)
     {
-        if(change & CHANGED_OWNER){
+        setupListens();
+        updateDisplay();
+        sendMetaToCombat();
+    }
+    
+    changed(integer c)
+    {
+        if(c & CHANGED_INVENTORY){
+            startConfigRead();
+        }
+        if(c & CHANGED_OWNER){
+            cleanupListens();
             setupListens();
             sendMetaToCombat();
         }
     }
     
-    listen(integer channel, string name, key id, string message)
+    listen(integer ch, string name, key id, string msg)
     {
-        if(llGetOwnerKey(id) != owner) return;
-        
-        if(channel == 99){
-            handleSetupDialog(message);
+        if(ch == CH_CMD && id == llGetOwner()){
+            string m = llToLower(trim(msg));
+            
+            if(m == "titler config"){
+                menuStart(id);
+                showConfigMenu();
+                return;
+            }
+            
+            if(m == "titler hide"){
+                VISIBLE = 0;
+                updateDisplay();
+                saveConfig();
+                return;
+            }
+            
+            if(m == "titler show"){
+                VISIBLE = 1;
+                updateDisplay();
+                saveConfig();
+                return;
+            }
+            
+            // Parse commands with arguments
+            if(llSubStringIndex(m, "titler name ") == 0){
+                displayName = llGetSubString(msg, 12, -1);
+                updateDisplay();
+                saveConfig();
+                sendMetaToCombat();
+                return;
+            }
+            
+            if(llSubStringIndex(m, "titler breed ") == 0){
+                breedName = llGetSubString(msg, 13, -1);
+                updateDisplay();
+                saveConfig();
+                return;
+            }
+            
+            if(llSubStringIndex(m, "titler type ") == 0){
+                typeStr = llGetSubString(msg, 12, -1);
+                updateDisplay();
+                saveConfig();
+                sendMetaToCombat();
+                return;
+            }
+        }
+        else if(ch == MENU_CH && id == MENU_USER){
+            // Check if it's a button or text input
+            list btns = ["Format", "Colors", "Visibility", "Show XP", "Show CH", "Show Type", "Name", "Breed", "Type", "Save", "Reset", "Close"];
+            if(llListFindList(btns, [msg]) >= 0){
+                handleMenuButton(msg);
+            }
+            else {
+                // Text input - determine context by last button clicked
+                // For simplicity, assume it's for name/breed/type based on content
+                if(llSubStringIndex(msg, "/") > 0){
+                    // Likely a type with slash
+                    typeStr = msg;
+                    sendMetaToCombat();
+                }
+                else if(llStringLength(msg) < 20){
+                    // Short input, likely breed or name
+                    displayName = msg;
+                    sendMetaToCombat();
+                }
+                else {
+                    displayName = msg;
+                    sendMetaToCombat();
+                }
+                updateDisplay();
+                saveConfig();
+                showConfigMenu();
+            }
         }
     }
     
@@ -433,22 +678,51 @@ default
             handleCooldownUpdate(payload);
             return;
         }
+        
+        if(opcode == OP_FACTORY_REQ){
+            // Factory reset requested
+            llLinksetDataDelete(CK("displayName"));
+            llLinksetDataDelete(CK("breedName"));
+            llLinksetDataDelete(CK("typeStr"));
+            llLinksetDataDelete(CK("genderSymbol"));
+            llLinksetDataDelete(CK("FORMAT"));
+            llLinksetDataDelete(CK("SHOW_XP"));
+            llLinksetDataDelete(CK("SHOW_CHARGE"));
+            llLinksetDataDelete(CK("SHOW_TYPE"));
+            llLinksetDataDelete(CK("ALPHA"));
+            llLinksetDataDelete(CK("VISIBLE"));
+            llResetScript();
+            return;
+        }
+    }
+    
+    dataserver(key rq, string data)
+    {
+        if(rq == rqConfig){
+            if(data == EOF){
+                rdConfig = FALSE;
+                rqConfig = NULL_KEY;
+                saveConfig();
+                updateDisplay();
+                return;
+            }
+            
+            applyConfigLine(data);
+            rqConfig = llGetNotecardLine(NC_CONFIG, ++lnConfig);
+            return;
+        }
     }
     
     timer()
     {
-        // Update animated elements (invuln flash, sweet spot pulse)
-        if(INVULN || SWEET){
-            updateInvulnIndicator();
-            updateCooldownIndicator();
+        // Update display for animations
+        if(INVULN){
+            updateDisplay();
         }
         else {
-            // Can reduce timer frequency when nothing is animating
-            if(llGetTime() - lastUpdate > 1.0){
-                stopTimer();
-            }
+            // Stop timer when no animations needed
+            llSetTimerEvent(0.0);
+            needsTimer = FALSE;
         }
-        
-        lastUpdate = llGetTime();
     }
 }
