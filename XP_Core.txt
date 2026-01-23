@@ -1,9 +1,13 @@
-// XP_Core RC-1.0 — parses ExpCurve notecard and answers Core with XPMAX
+// XP_Core RC-1.0.1 — parses ExpCurve notecard and answers Core with XPMAX + FIXES
 // Link API:
 //   ← OP_XP_REQ   payload: "LV:<n>"
 //   → OP_XP_REPLY payload: "XPMAX:<n>"
 // Linkset Data keys written:
 //   xp:mode, xp:base, xp:per, xp:growth, xp:loser_pct, xp:lv:<n>
+// Fixes in RC-1.0.1:
+//   • Bounds checking for list parsing in handleReq()
+//   • Input validation for all notecard values
+//   • Protection against empty value strings
 // Notes: LSL-safe (no ternary, no break), keeps memory tiny by writing table rows to Linkset Data.
 
 integer OP_XP_REQ   = 7400;
@@ -28,6 +32,8 @@ integer applyXP(string line)
     if(p <= 0) return FALSE;
     string k = llStringTrim(llGetSubString(line,0,p-1), STRING_TRIM);
     string v = llStringTrim(llGetSubString(line,p+1,-1), STRING_TRIM);
+    // FIXED: Validate value is not empty before converting
+    if(v == "") return FALSE;
 
     if(k == "MODE"){ XP_MODE = v; llLinksetDataWrite(K("mode"), XP_MODE); return TRUE; }
     if(k == "XP_BASE"){ XP_BASE = (float)v; llLinksetDataWrite(K("base"), (string)XP_BASE); return TRUE; }
@@ -97,7 +103,14 @@ integer handleReq(string payload)
 {
     list P = llParseString2List(payload, ["|",":"], []);
     integer L = 1; integer i; integer n = llGetListLength(P);
-    for(i=0;i<n-1;i+=2){ string a = llList2String(P,i); string b = llList2String(P,i+1); if(a == "LV") L = (integer)((float)b); }
+    // FIXED: Bounds checking in loop
+    for(i=0;i<n-1;i+=2){ 
+        if(i+1 >= n) jump done_parse; // Safety
+        string a = llList2String(P,i); 
+        string b = llList2String(P,i+1); 
+        if(a == "LV") { if(b != "") L = (integer)((float)b); }
+    }
+    @done_parse;
     integer need = xpNextFor(L);
     string out = "XPMAX:" + (string)need;
     llMessageLinked(LINK_SET, OP_XP_REPLY, out, NULL_KEY);
