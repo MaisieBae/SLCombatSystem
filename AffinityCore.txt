@@ -33,7 +33,7 @@
 
 // ===== Opcodes =====
 integer OP_TITLER_META  = 7002;
-integer OP_ITEM_BUFF    = 7102;
+integer OP_ITEM_BUFF    = 7110; // FIXED: was 7102, collided with OP_ITEM_UI in Core.txt
 integer OP_TYPE_REQ     = 7600;
 integer OP_TYPE_REPLY   = 7601;
 
@@ -65,7 +65,6 @@ integer idxOf(list L, string v){
     integer i; integer n=llGetListLength(L); 
     if(n == 0) return -1; // Empty list
     for(i=0;i<n;i++){ 
-        if(i >= n) return -1; // Safety check
         if(llList2String(L,i)==v) return i; 
     } 
     return -1; 
@@ -242,12 +241,19 @@ default
     {
         // Load TypeChart
         startType();
-        // Export initial buff totals (0s on first run)
-        writeBuffTotals();
+        // FIXED: Load existing buff totals from LinksetData instead of wiping with 0s on reset
+        string v;
+        v=llLinksetDataRead(K_BUFF("ATK"));  if(v!="") B_ATK=(integer)((float)v);
+        v=llLinksetDataRead(K_BUFF("DEF"));  if(v!="") B_DEF=(integer)((float)v);
+        v=llLinksetDataRead(K_BUFF("SPA"));  if(v!="") B_SPA=(integer)((float)v);
+        v=llLinksetDataRead(K_BUFF("SPD2")); if(v!="") B_SPD2=(integer)((float)v);
+        v=llLinksetDataRead(K_BUFF("SPD"));  if(v!="") B_SPD=(integer)((float)v);
+        v=llLinksetDataRead(K_BUFF("DEX"));  if(v!="") B_DEX=(integer)((float)v);
     }
 
     changed(integer c)
     {
+        if(c & CHANGED_OWNER){ llLinksetDataReset(); llResetScript(); } // FIXED: added owner-change reset
         if(c & CHANGED_INVENTORY){ startType(); }
     }
 

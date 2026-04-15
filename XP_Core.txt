@@ -96,6 +96,7 @@ integer xpNextFor(integer level)
 
     integer need = (integer)llRound(base + scaledInc);
     if(need < 1) need = 1;
+    if(need > 2000000000) need = 2000000000; // FIXED: guard against integer overflow at high levels
     return need;
 }
 

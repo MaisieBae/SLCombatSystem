@@ -57,7 +57,7 @@ integer applyGC(string line)
     string k = trim(llGetSubString(line,0,p-1));
     string v = trim(llGetSubString(line,p+1,-1));
     if(k=="SOCIAL_CH") CH_SOC = (integer)((float)v);
-    else if(k=="COMBAT_CH") CH_CMD = (integer)((float)v); // if you want a separate HUD channel, add HUD_CH key instead
+    // FIXED: removed COMBAT_CH→CH_CMD mapping; COMBAT_CH is the combat bus, not the HUD cmd channel
     else if(k=="CREATURE_LABEL") GC_CREATURE_LABEL = v;
     else if(k=="TRAINER_LABEL")  GC_TRAINER_LABEL  = v;
     else if(k=="AFF_MAX") gAffMax = (integer)((float)v);
@@ -70,8 +70,16 @@ integer applyGC(string line)
 integer sendIVs(key to)
 {
     if(to==NULL_KEY) return FALSE;
-    // If you later store IVs in Linkset Data, read: core:iv:HP etc. For now, placeholders 100.
-    integer IV_HP=100, IV_ATK=100, IV_DEF=100, IV_SPA=100, IV_SPD=100, IV_SPE=100, IV_DEX=100;
+    // FIXED: read actual IV multipliers from LinksetData (written by CombatCore ivEnsure())
+    integer IV_HP  = (integer)(llRound((float)llLinksetDataRead("core:iv:HP") * 100.0));
+    integer IV_ATK = (integer)(llRound((float)llLinksetDataRead("core:iv:ATK") * 100.0));
+    integer IV_DEF = (integer)(llRound((float)llLinksetDataRead("core:iv:DEF") * 100.0));
+    integer IV_SPA = (integer)(llRound((float)llLinksetDataRead("core:iv:SPA") * 100.0));
+    integer IV_SPD = (integer)(llRound((float)llLinksetDataRead("core:iv:SPD") * 100.0));
+    integer IV_SPE = (integer)(llRound((float)llLinksetDataRead("core:iv:SPD2") * 100.0)); // SPD2=Sp.Def
+    integer IV_DEX = (integer)(llRound((float)llLinksetDataRead("core:iv:DEX") * 100.0));
+    if(IV_HP==0) IV_HP=100; if(IV_ATK==0) IV_ATK=100; if(IV_DEF==0) IV_DEF=100;
+    if(IV_SPA==0) IV_SPA=100; if(IV_SPD==0) IV_SPD=100; if(IV_SPE==0) IV_SPE=100; if(IV_DEX==0) IV_DEX=100;
     string txt = "[IVs] "+GC_CREATURE_LABEL+" "+gName+"  Lv "+(string)gLV+
                  "\nHP:"+(string)IV_HP+"  ATK:"+(string)IV_ATK+"  DEF:"+(string)IV_DEF+
                  "  SPA:"+(string)IV_SPA+"  SPD:"+(string)IV_SPD+"  SPE:"+(string)IV_SPE+"  DEX:"+(string)IV_DEX;
@@ -142,7 +150,7 @@ default
     {
         gTrainer = llGetOwner();
         loadGC();
-        llListen(CH_CMD, "", NULL_KEY, "");
+        llListen(CH_CMD, "", llGetOwner(), ""); // FIXED: was NULL_KEY (open to everyone)
     }
 
     on_rez(integer p){ llResetScript(); }

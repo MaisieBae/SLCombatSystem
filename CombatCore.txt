@@ -1,4 +1,4 @@
-// CombatCore RC‑4.6 — parry caps + AffinityCore types/buffs, XP via XP_Core + FIXES
+// CombatCore RC‑4.7 — audit fixes: level cap, loserPct, super-eff FX, rez timer, spdMult
 // -------------------------------------------------------------------------------------------------
 // What's new vs RC‑4.5
 //   • FIXES (RC-4.6):
@@ -58,6 +58,7 @@ integer LV = 1; integer XP = 0; integer XPMAX = 100;
 integer HP = 30; integer HPMAX = 30;
 integer ATK = 5; integer DEF = 5; integer SPA = 5; integer SPD2 = 5; integer SPD = 5; integer DEX = 5;
 integer CHARGE = 0; integer CHARGEMAX = 4;
+integer MAX_LEVEL = 100; // hard cap; adjust in GameConfig if needed
 
 // Cooldown / combo
 float ATKCD_BASE = 1.8;
@@ -337,7 +338,7 @@ integer finalizeDamage(integer dmg, string src)
         llSay(0, atkName+" knocked out "+defName+"!");
         wlv=LAST_HIT_LV; if(wlv<=0) wlv=LV;
         winXP=xpWinner(wlv,LV);
-        if(LOSER_PCT<=0) loadLoserPct();
+        loadLoserPct(); // always refresh from XP_Core's linkset data
         loseXP=(integer)llRound((float)winXP*((float)LOSER_PCT/100.0)); if(loseXP<1) loseXP=1;
         addXP(loseXP);
         llMessageLinked(LINK_SET, OP_FX, "CUE:KO", NULL_KEY);
@@ -396,7 +397,7 @@ integer computeBaseDamage(string wMode, string wType, string wCrit)
     if(JITTER_PCT>0){ float j; j=(float)JITTER_PCT/100.0; dmgf*=randIn(j); }
     dmg=(integer)llRound(dmgf); 
     if(dmg<1) dmg=1;
-    if(eff>1.0) llMessageLinked(LINK_SET, OP_FX, "CUE:COMBO_HIT", NULL_KEY); // reuse crit sfx for SE
+    if(eff>1.0) llMessageLinked(LINK_SET, OP_FX, "CUE:SUPER_EFF", NULL_KEY); // dedicated super-effective cue
     return dmg;
 }
 
@@ -502,6 +503,7 @@ integer addXP(integer amt){
     XP+=amt; 
     up=FALSE; 
     while(XP>=XPMAX){ 
+        if(LV >= MAX_LEVEL){ XP=XPMAX-1; jump xp_cap; } // hard level cap
         XP-=XPMAX; 
         LV+=1; 
         XPMAX=xpNextFor(LV); 
@@ -510,6 +512,7 @@ integer addXP(integer amt){
         up=TRUE; 
         llMessageLinked(LINK_SET, OP_FX, "CUE:LEVELUP", NULL_KEY); 
     } 
+    @xp_cap;
     saveState(); 
     pushStats(); 
     return XP; 
@@ -544,7 +547,7 @@ default
         llSetTimerEvent(1.0);
     }
 
-    on_rez(integer p){ llResetTime(); pushStats(); }
+    on_rez(integer p){ lastAtkTS = 0.0; pushStats(); } // reset attack timer so cooldown appears elapsed on rez
 
     changed(integer c)
     {

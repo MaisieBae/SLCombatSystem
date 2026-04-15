@@ -30,6 +30,7 @@ integer PARRY_COOLDOWN_MS = 1500; // min delay between opens
 integer PARRY_BONUS       = 1;    // bonus charge or similar (Core decides meaning)
 
 // ===== State =====
+integer L_GESTURE = 0; // FIXED: store listen handle for cleanup
 integer gActive = FALSE;
 float   gUntil  = 0.0;
 float   gNext   = 0.0; // earliest next open (cooldown)
@@ -39,12 +40,7 @@ string trim(string s){ return llStringTrim(s, STRING_TRIM); }
 float nowf(){ return llGetTime(); }
 integer now(){ return llGetUnixTime(); }
 
-integer msToSec1000(integer ms){ // convert ms → seconds as float (prec at 0.001s)
-    float f = (float)ms / 1000.0;
-    if(f < 0.001) f = 0.001;
-    llSetTimerEvent(0.1); // ensure timer runs while windows are active
-    return TRUE;
-}
+// msToSec1000() removed — was dead code (never called)
 
 integer canOpen(){ if(nowf() < gNext) return FALSE; return TRUE; }
 
@@ -54,7 +50,7 @@ integer openWindow(integer ms)
     if(dur < 0.05) dur = 0.05;
     gActive = TRUE;
     gUntil = nowf() + dur;
-    if(nowf() + 2.0 > gNext) gNext = nowf() + ((float)PARRY_COOLDOWN_MS / 1000.0);
+    gNext = nowf() + ((float)PARRY_COOLDOWN_MS / 1000.0); // FIXED: always set cooldown unconditionally
     llMessageLinked(LINK_SET, OP_FX, "CUE:PARRY_READY", NULL_KEY);
     llSetTimerEvent(0.05);
     return TRUE;
@@ -103,8 +99,8 @@ integer applyGC(string line)
     if(p<=0) return FALSE;
     string k = trim(llGetSubString(line,0,p-1));
     string v = trim(llGetSubString(line,p+1,-1));
-    if(k=="PARRY_WINDOW_MS")   PARRY_WINDOW_MS   = (integer)((float)v);
-    else if(k=="PARRY_COOLDOWN_MS") PARRY_COOLDOWN_MS = (integer)((float)v);
+    if(k=="PARRY_WINDOW_MS"){   integer wms=(integer)((float)v); if(wms<50) wms=50; if(wms>5000) wms=5000; PARRY_WINDOW_MS=wms; } // FIXED: clamped
+    else if(k=="PARRY_COOLDOWN_MS"){ integer cms=(integer)((float)v); if(cms<50) cms=50; if(cms>10000) cms=10000; PARRY_COOLDOWN_MS=cms; } // FIXED: clamped
     else if(k=="PARRY_BONUS")  PARRY_BONUS  = (integer)((float)v);
     return TRUE;
 }
@@ -115,12 +111,12 @@ default
     state_entry()
     {
         startGC();
-        llListen(CH_GESTURE, "", llGetOwner(), "");
+        L_GESTURE = llListen(CH_GESTURE, "", llGetOwner(), ""); // FIXED: stored handle
         llSetTimerEvent(0.0);
     }
 
-    on_rez(integer p){ llResetScript(); }
-    changed(integer c){ if(c & CHANGED_OWNER) llResetScript(); }
+    on_rez(integer p){ gActive=FALSE; gUntil=0.0; llSetTimerEvent(0.0); } // FIXED: no full reset on rez
+    changed(integer c){ if(c & CHANGED_OWNER){ if(L_GESTURE) llListenRemove(L_GESTURE); llResetScript(); } }
 
     dataserver(key rq, string data)
     {
